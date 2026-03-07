@@ -88,6 +88,7 @@ pub fn parse_packet(buf: &[u8; PACKET_SIZE]) -> Option<CogSample> {
 /// Returns a `CogHandle` for sending commands and receiving samples/state
 /// from the main thread. The worker runs its own Tokio current-thread runtime
 /// to drive bluer's async Bluetooth API.
+#[cfg(target_os = "linux")]
 pub fn spawn_cog_worker() -> CogHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<CogCommand>();
     let (sample_tx, sample_rx) = mpsc::sync_channel::<CogSample>(1024);
@@ -112,12 +113,27 @@ pub fn spawn_cog_worker() -> CogHandle {
     }
 }
 
+/// Stub implementation for non-Linux platforms (BlueZ/bluer is Linux-only).
+#[cfg(not(target_os = "linux"))]
+pub fn spawn_cog_worker() -> CogHandle {
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<CogCommand>();
+    let (_sample_tx, sample_rx) = mpsc::sync_channel::<CogSample>(1);
+    let (_state_tx, state_rx) = mpsc::channel::<CogState>();
+    CogHandle {
+        cmd_tx,
+        sample_rx,
+        state_rx,
+    }
+}
+
 /// Send a state update, ignoring disconnected receiver.
+#[cfg(target_os = "linux")]
 fn send_state(tx: &mpsc::Sender<CogState>, state: CogState) {
     eprintln!("[cog] state -> {state:?}");
     let _ = tx.send(state);
 }
 
+#[cfg(target_os = "linux")]
 async fn worker_loop(
     cmd_rx: mpsc::Receiver<CogCommand>,
     sample_tx: mpsc::SyncSender<CogSample>,
@@ -172,6 +188,7 @@ async fn worker_loop(
 }
 
 /// Scan for a Cognionics HD-72 device via Bluetooth Classic (BR/EDR).
+#[cfg(target_os = "linux")]
 async fn scan_for_device() -> Result<([u8; 6], String), bluer::Error> {
     use bluer::AdapterEvent;
     use futures::StreamExt;
@@ -228,6 +245,7 @@ async fn scan_for_device() -> Result<([u8; 6], String), bluer::Error> {
 
 /// Connect to the device, send impedance-off command, and enter the read loop.
 /// Returns `Ok(())` when cleanly disconnected via `CogCommand::Disconnect`.
+#[cfg(target_os = "linux")]
 async fn connect_and_stream(
     addr: [u8; 6],
     cmd_rx: &mpsc::Receiver<CogCommand>,

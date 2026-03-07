@@ -1,0 +1,13 @@
+[package]
+edition = "2018"
+name = "lsl-sys"
+version = "0.1.1"
+authors = ["Intheon <contact@intheon.io>", "Christian Kothe <christian.kothe@intheon.io>"]
+links = "lsl"
+description = "Low-level bindings to the system liblsl library (lab streaming layer)."
+keywords = ["lsl", "ffi"]
+categories = ["external-ffi-bindings"]
+license = "MIT"
+
+[build-dependencies.cmake]
+version = "0.1.44"

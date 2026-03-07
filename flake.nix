@@ -68,16 +68,9 @@
           dbus
         ])
         ++ pkgs.lib.optionals isDarwin (with pkgs; [
-          darwin.apple_sdk.frameworks.AudioUnit
-          darwin.apple_sdk.frameworks.CoreAudio
-          darwin.apple_sdk.frameworks.CoreFoundation
-          darwin.apple_sdk.frameworks.CoreGraphics
-          darwin.apple_sdk.frameworks.CoreText
-          darwin.apple_sdk.frameworks.AppKit
-          darwin.apple_sdk.frameworks.Metal
-          darwin.apple_sdk.frameworks.IOBluetooth
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
+          # Frameworks are provided automatically by the Darwin stdenv SDK.
+          # libiconv is needed for some Rust crates on macOS.
+          libiconv
         ]);
 
         # Tools needed at build time
@@ -96,6 +89,8 @@
           inherit buildInputs nativeBuildInputs;
 
           ZSTD_SYS_USE_PKG_CONFIG = "1";
+          # Patched lsl-sys uses system liblsl framework on macOS
+          LIBLSL_FRAMEWORK_PATH = "${pkgs.liblsl}/Frameworks";
         };
 
         # Build dependencies first (for caching)
@@ -136,6 +131,19 @@
           ] ++ buildInputs ++ nativeBuildInputs;
 
           ZSTD_SYS_USE_PKG_CONFIG = "1";
+          # Patched lsl-sys uses the system liblsl framework on macOS
+          LIBLSL_FRAMEWORK_PATH = "${pkgs.liblsl}/Frameworks";
+        } // pkgs.lib.optionalAttrs isDarwin {
+          # The nixpkgs liblsl framework has its install name pointing to 'lib/lsl.framework'
+          # but the actual bundle is at 'Frameworks/lsl.framework'. DYLD_FRAMEWORK_PATH
+          # makes dyld search the Frameworks/ dir by framework name, bypassing the stale path.
+          DYLD_FRAMEWORK_PATH = "${pkgs.liblsl}/Frameworks";
+          shellHook = ''
+            XCODE_PATH="$(xcode-select -p 2>/dev/null || true)"
+            if [ -n "$XCODE_PATH" ]; then
+              export PATH="$XCODE_PATH/usr/bin:$PATH"
+            fi
+          '';
         } // pkgs.lib.optionalAttrs isLinux {
           LD_LIBRARY_PATH = runtimeLibPath;
         });
