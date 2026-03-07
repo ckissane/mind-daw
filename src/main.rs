@@ -448,7 +448,6 @@ impl MindDaw {
                         waveform_data
                             .iter()
                             .enumerate()
-                            .take(8)
                             .map(|(ch, data)| {
                                 div()
                                     .flex()
@@ -460,7 +459,7 @@ impl MindDaw {
                                             .w(px(32.0))
                                             .child(format!("Ch{ch}")),
                                     )
-                                    .child(waveform_bar(data))
+                                    .child(waveform_canvas(data))
                                     .into_any_element()
                             })
                             .collect::<Vec<_>>(),
@@ -629,7 +628,6 @@ impl MindDaw {
                         cog_waveform_data
                             .iter()
                             .enumerate()
-                            .take(8)
                             .map(|(ch, data)| {
                                 div()
                                     .flex()
@@ -642,7 +640,7 @@ impl MindDaw {
                                             .text_color(cx.theme().muted_foreground)
                                             .child(format!("Ch{ch}")),
                                     )
-                                    .child(waveform_bar(data))
+                                    .child(waveform_canvas(data))
                                     .into_any_element()
                             })
                             .collect::<Vec<_>>(),
@@ -673,42 +671,124 @@ impl MindDaw {
     }
 }
 
-/// Render a simple ASCII-style waveform bar from sample data.
-fn waveform_bar(data: &[f32]) -> Div {
-    let display_width = 60;
-    let text = if data.is_empty() {
-        "—".repeat(display_width)
-    } else {
-        let step = (data.len() as f32 / display_width as f32).max(1.0);
-        let mut chars = String::with_capacity(display_width);
-        for i in 0..display_width {
-            let idx = ((i as f32) * step) as usize;
-            let val = data.get(idx).copied().unwrap_or(0.0);
-            let ch = if val > 0.5 {
-                '█'
-            } else if val > 0.2 {
-                '▓'
-            } else if val > 0.0 {
-                '▒'
-            } else if val > -0.2 {
-                '░'
-            } else if val > -0.5 {
-                '▒'
-            } else {
-                '▓'
-            };
-            chars.push(ch);
-        }
-        chars
-    };
+/// Find the best display offset using auto-correlation (oscilloscope trigger).
+/// Searches for the offset where the signal best correlates with itself,
+/// producing a stable, repeating waveform display.
+fn autocorrelate_offset(data: &[f32], display_len: usize) -> usize {
+    if data.len() <= display_len {
+        return 0;
+    }
 
-    div()
-        .flex_1()
-        .font_family("monospace")
-        .text_xs()
-        .rounded_sm()
-        .px_1()
-        .child(text)
+    let search_len = (data.len() - display_len).min(display_len);
+    if search_len < 2 {
+        return 0;
+    }
+
+    // Use the first display_len samples as the reference
+    let reference = &data[..display_len.min(data.len())];
+
+    let mut best_offset = 0;
+    let mut best_corr = f32::NEG_INFINITY;
+
+    // Search for the lag that maximizes correlation
+    for lag in 1..search_len {
+        let mut corr = 0.0f32;
+        let compare_len = display_len.min(data.len() - lag);
+        for i in 0..compare_len {
+            corr += reference[i] * data[lag + i];
+        }
+        if corr > best_corr {
+            best_corr = corr;
+            best_offset = lag;
+        }
+    }
+
+    best_offset
+}
+
+/// Render an oscilloscope-style waveform trace using gpui canvas with stroked paths.
+fn waveform_canvas(data: &[f32]) -> impl IntoElement {
+    let data = data.to_vec();
+
+    canvas(
+        move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+            // Prepaint: compute the polyline points
+            let w: f32 = bounds.size.width.into();
+            let h: f32 = bounds.size.height.into();
+            let ox: f32 = bounds.origin.x.into();
+            let oy: f32 = bounds.origin.y.into();
+            if data.is_empty() || w < 2.0 || h < 2.0 {
+                return (bounds, Vec::new());
+            }
+
+            let display_samples = (w as usize).min(data.len());
+            let offset = autocorrelate_offset(&data, display_samples);
+
+            // Find range for normalization
+            let slice = &data[offset..(offset + display_samples).min(data.len())];
+            let min_val = slice.iter().copied().fold(f32::INFINITY, f32::min);
+            let max_val = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = (max_val - min_val).max(1e-10);
+
+            let padding = 2.0f32;
+            let draw_h = h - padding * 2.0;
+
+            let points: Vec<(f32, f32)> = (0..display_samples)
+                .map(|i| {
+                    let idx = offset + i;
+                    let val = data.get(idx).copied().unwrap_or(0.0);
+                    let x = ox + (i as f32 / (display_samples - 1).max(1) as f32) * w;
+                    // Invert Y: high values at top
+                    let norm = (val - min_val) / range;
+                    let y = oy + padding + draw_h * (1.0 - norm);
+                    (x, y)
+                })
+                .collect();
+
+            (bounds, points)
+        },
+        move |_bounds: Bounds<Pixels>, (bounds, points): (Bounds<Pixels>, Vec<(f32, f32)>), window: &mut Window, _cx: &mut App| {
+            // Paint background box
+            window.paint_quad(gpui::fill(
+                bounds,
+                gpui::hsla(0.0, 0.0, 0.08, 1.0),
+            ));
+            // Paint border
+            window.paint_quad(gpui::outline(
+                bounds,
+                gpui::hsla(0.0, 0.0, 0.25, 1.0),
+                gpui::BorderStyle::Solid,
+            ));
+
+            if points.len() < 2 {
+                return;
+            }
+
+            // Draw center line (zero reference)
+            let h: f32 = bounds.size.height.into();
+            let oy: f32 = bounds.origin.y.into();
+            let mid_y = oy + h / 2.0;
+            let mut center_line = PathBuilder::stroke(px(0.5));
+            center_line.move_to(point(bounds.origin.x, px(mid_y)));
+            center_line.line_to(point(bounds.origin.x + bounds.size.width, px(mid_y)));
+            if let Ok(path) = center_line.build() {
+                window.paint_path(path, gpui::hsla(0.0, 0.0, 0.2, 1.0));
+            }
+
+            // Draw the waveform trace
+            let mut builder = PathBuilder::stroke(px(1.5));
+            builder.move_to(point(px(points[0].0), px(points[0].1)));
+            for &(x, y) in &points[1..] {
+                builder.line_to(point(px(x), px(y)));
+            }
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, gpui::hsla(0.33, 0.9, 0.55, 1.0)); // green trace
+            }
+        },
+    )
+    .flex_1()
+    .h(px(28.0))
+    .min_w(px(200.0))
 }
 
 fn main() {

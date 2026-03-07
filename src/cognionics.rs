@@ -114,6 +114,7 @@ pub fn spawn_cog_worker() -> CogHandle {
 
 /// Send a state update, ignoring disconnected receiver.
 fn send_state(tx: &mpsc::Sender<CogState>, state: CogState) {
+    eprintln!("[cog] state -> {state:?}");
     let _ = tx.send(state);
 }
 
@@ -175,11 +176,14 @@ async fn scan_for_device() -> Result<([u8; 6], String), bluer::Error> {
     use bluer::AdapterEvent;
     use futures::StreamExt;
 
+    eprintln!("[cog] scan: creating BlueZ session...");
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
+    eprintln!("[cog] scan: adapter = {}", adapter.name());
     adapter.set_powered(true).await?;
 
     // Set discovery filter to BR/EDR only
+    eprintln!("[cog] scan: setting BR/EDR discovery filter...");
     adapter
         .set_discovery_filter(bluer::DiscoveryFilter {
             transport: bluer::DiscoveryTransport::BrEdr,
@@ -187,6 +191,7 @@ async fn scan_for_device() -> Result<([u8; 6], String), bluer::Error> {
         })
         .await?;
 
+    eprintln!("[cog] scan: starting discovery (15s timeout)...");
     let events = adapter.discover_devices().await?;
     tokio::pin!(events);
 
@@ -199,14 +204,19 @@ async fn scan_for_device() -> Result<([u8; 6], String), bluer::Error> {
                 if let AdapterEvent::DeviceAdded(addr) = event {
                     let device = adapter.device(addr)?;
                     if let Ok(Some(name)) = device.name().await {
+                        eprintln!("[cog] scan: found device {addr} name={name:?}");
                         if name.contains("HD-72") || name.contains("Cognionics") {
+                            eprintln!("[cog] scan: matched Cognionics device!");
                             let addr_bytes = addr.0;
                             return Ok((addr_bytes, name));
                         }
+                    } else {
+                        eprintln!("[cog] scan: found device {addr} (no name)");
                     }
                 }
             }
             () = &mut timeout => {
+                eprintln!("[cog] scan: timed out");
                 return Err(bluer::Error {
                     kind: bluer::ErrorKind::Failed,
                     message: "Scan timed out — no Cognionics device found".into(),
@@ -226,37 +236,66 @@ async fn connect_and_stream(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let addr_fmt = format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+    );
+    eprintln!("[cog] connect: target {addr_fmt}");
+
+    eprintln!("[cog] connect: creating BlueZ session...");
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
     let bt_addr = bluer::Address(addr);
     let device = adapter.device(bt_addr)?;
 
     // Ensure device is paired
-    if !device.is_paired().await? {
+    let paired = device.is_paired().await?;
+    eprintln!("[cog] connect: paired={paired}");
+    if !paired {
+        eprintln!("[cog] connect: initiating pairing...");
         device.pair().await?;
+        eprintln!("[cog] connect: pairing complete");
+    }
+
+    // Disconnect any existing OS-level connection (avoids EBUSY on RFCOMM)
+    let connected = device.is_connected().await.unwrap_or(false);
+    if connected {
+        eprintln!("[cog] connect: device already connected at OS level, disconnecting first...");
+        let _ = device.disconnect().await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        eprintln!("[cog] connect: OS-level disconnect done");
     }
 
     // Connect via RFCOMM (channel 1 is typical for SPP)
+    eprintln!("[cog] connect: opening RFCOMM channel {RFCOMM_CHANNEL}...", RFCOMM_CHANNEL = 1);
     let mut stream = bluer::rfcomm::Stream::connect(bluer::rfcomm::SocketAddr {
         addr: bt_addr,
         channel: 1,
     })
     .await?;
+    eprintln!("[cog] connect: RFCOMM connected");
 
     // Send impedance-off command
+    eprintln!("[cog] connect: sending impedance-off (0x{IMPEDANCE_OFF_CMD:02X})...");
     stream.write_all(&[IMPEDANCE_OFF_CMD]).await?;
     stream.flush().await?;
+    eprintln!("[cog] connect: impedance-off sent, entering read loop");
 
     send_state(state_tx, CogState::Streaming);
 
     // Read loop: sync-byte alignment then full packets
     let mut packet_buf = [0u8; PACKET_SIZE];
     let mut single = [0u8; 1];
+    let mut packet_count: u64 = 0;
+    let mut sync_miss: u64 = 0;
 
     loop {
         // Check for disconnect command (non-blocking)
         match cmd_rx.try_recv() {
-            Ok(CogCommand::Disconnect) | Ok(CogCommand::Shutdown) => break,
+            Ok(CogCommand::Disconnect) | Ok(CogCommand::Shutdown) => {
+                eprintln!("[cog] read: disconnect requested after {packet_count} packets");
+                break;
+            }
             _ => {}
         }
 
@@ -267,6 +306,7 @@ async fn connect_and_stream(
                 packet_buf[0] = SYNC_BYTE;
                 break;
             }
+            sync_miss += 1;
         }
 
         // Read the remaining 194 bytes
@@ -274,11 +314,19 @@ async fn connect_and_stream(
 
         // Parse and send
         if let Some(sample) = parse_packet(&packet_buf) {
+            packet_count += 1;
+            if packet_count <= 3 || packet_count % 300 == 0 {
+                eprintln!(
+                    "[cog] read: pkt#{packet_count} counter={} status=0x{:02X} ch0={:.1}uV sync_misses={sync_miss}",
+                    sample.counter, sample.status, sample.channels[0]
+                );
+            }
             // If the channel is full, drop the sample (backpressure)
             let _ = sample_tx.try_send(sample);
         }
     }
 
+    eprintln!("[cog] connect: read loop ended, total packets={packet_count}");
     Ok(())
 }
 
