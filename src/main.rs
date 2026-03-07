@@ -918,21 +918,14 @@ fn compute_spectrum(data: &[f32], fft_size: usize) -> Vec<f32> {
     // Return magnitude of positive frequencies (skip DC, up to Nyquist),
     // whitened: multiply by bin index to flatten the 1/f EEG power spectrum,
     // then subtract the minimum so the quietest bin sits at zero.
-    let mut spec: Vec<f32> = buf[1..fft_size / 2]
+    let spec: Vec<f32> = buf[1..fft_size / 2]
         .iter()
         .enumerate()
         .map(|(i, c)| {
             let mag = c.norm() / fft_size as f32;
-            mag * (i + 1) as f32
+            mag  as f32
         })
         .collect();
-    // Subtract the 50th percentile floor so only the top 10% of bins show
-    let mut sorted = spec.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p90 = sorted[sorted.len() * 5 / 10];
-    for v in &mut spec {
-        *v = (*v - p90).max(0.0);
-    }
     spec
 }
 
@@ -957,7 +950,10 @@ fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
                 .map(|&m| (1.0 + m * 1000.0).ln())
                 .collect();
 
-            let max_val = log_spec.iter().copied().fold(0.0f32, f32::max).max(0.01);
+            let mut sorted_spec = log_spec.clone();
+            sorted_spec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p50 = sorted_spec[sorted_spec.len() / 2];
+            let max_val = (log_spec.iter().copied().fold(0.0f32, f32::max) - p50).max(0.01);
             let bar_w = w / log_spec.len() as f32;
             let padding = 1.0f32;
             let draw_h = h - padding * 2.0;
@@ -966,7 +962,7 @@ fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
                 .iter()
                 .enumerate()
                 .map(|(i, &val)| {
-                    let norm = (val / max_val).clamp(0.0, 1.0);
+                    let norm = ((val - p50) / max_val).clamp(0.0, 1.0);
                     let bar_h = draw_h * norm;
                     let x = ox + i as f32 * bar_w;
                     let y = oy + padding + draw_h - bar_h;
