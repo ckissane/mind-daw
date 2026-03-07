@@ -1,0 +1,5 @@
+# Override lsl-sys build script to use system liblsl instead of building
+# the bundled (2020-era) liblsl from source. The bundled boost is incompatible
+# with glibc 2.42+ and clang 21+. System liblsl is provided by nix (flake.nix).
+[target.x86_64-unknown-linux-gnu.lsl]
+rustc-link-lib = ["lsl"]
