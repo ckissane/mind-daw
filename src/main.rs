@@ -21,6 +21,66 @@ enum Tab {
     Words,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum BrainWaveBand {
+    All,
+    Delta, // 0.5–4 Hz
+    Theta, // 4–8 Hz
+    Alpha, // 8–13 Hz
+    Beta,  // 13–30 Hz
+    Gamma, // 30–80 Hz
+}
+
+const SPECTRUM_FFT_SIZE: usize = 128;
+const SPECTRUM_SAMPLE_RATE: f32 = 300.0;
+
+impl BrainWaveBand {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Delta => "Delta",
+            Self::Theta => "Theta",
+            Self::Alpha => "Alpha",
+            Self::Beta => "Beta",
+            Self::Gamma => "Gamma",
+        }
+    }
+
+    fn freq_range(self) -> (f32, f32) {
+        match self {
+            Self::All => (0.5, 150.0),
+            Self::Delta => (0.5, 4.0),
+            Self::Theta => (4.0, 8.0),
+            Self::Alpha => (8.0, 13.0),
+            Self::Beta => (13.0, 30.0),
+            Self::Gamma => (30.0, 80.0),
+        }
+    }
+
+    /// Return the (start, end) output-index range for `compute_spectrum`
+    /// which returns bins 1..fft_size/2 (index 0 = bin 1).
+    fn bin_range(self) -> (usize, usize) {
+        let (lo_hz, hi_hz) = self.freq_range();
+        let bin_hz = SPECTRUM_SAMPLE_RATE / SPECTRUM_FFT_SIZE as f32;
+        // compute_spectrum output[i] corresponds to bin (i+1), freq = (i+1)*bin_hz
+        let start = ((lo_hz / bin_hz).ceil() as usize).saturating_sub(1);
+        let end = (hi_hz / bin_hz).floor() as usize; // inclusive bin index, but we use it as exclusive slice end
+        let max_bin = SPECTRUM_FFT_SIZE / 2 - 1; // max output index
+        (start.min(max_bin), end.min(max_bin + 1))
+    }
+
+    fn hue(self) -> f32 {
+        match self {
+            Self::All => 0.0,
+            Self::Delta => 0.75, // purple
+            Self::Theta => 0.58, // cyan
+            Self::Alpha => 0.33, // green
+            Self::Beta => 0.15,  // orange
+            Self::Gamma => 0.0,  // red
+        }
+    }
+}
+
 /// Application state.
 struct MindDaw {
     discovered: Vec<StreamMeta>,
@@ -52,6 +112,7 @@ struct MindDaw {
 
     // UI
     active_tab: Tab,
+    spectrum_band: BrainWaveBand,
 }
 
 const COG_BUFFER_CAPACITY: usize = 150;
@@ -269,6 +330,7 @@ impl MindDaw {
             word_read_state: WordReadState::new(),
 
             active_tab: Tab::Spectrum,
+            spectrum_band: BrainWaveBand::All,
         }
     }
 
@@ -1284,9 +1346,17 @@ fn compute_spectrum(data: &[f32], fft_size: usize) -> Vec<f32> {
     spec
 }
 
-/// Render an FFT spectrum plot for one channel using gpui canvas.
-fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
-    let spectrum = compute_spectrum(data, 32);
+/// Render an FFT spectrum plot for one channel using gpui canvas,
+/// showing only the bins within the given band.
+fn spectrum_canvas(data: &[f32], ch: usize, band: BrainWaveBand) -> impl IntoElement {
+    let full_spectrum = compute_spectrum(data, SPECTRUM_FFT_SIZE);
+    let (bin_start, bin_end) = band.bin_range();
+    let spectrum: Vec<f32> = full_spectrum
+        .get(bin_start..bin_end)
+        .unwrap_or(&[])
+        .to_vec();
+    let band_hue = band.hue();
+    let use_channel_hue = band == BrainWaveBand::All;
 
     canvas(
         move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
@@ -1296,7 +1366,7 @@ fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
             let oy: f32 = bounds.origin.y.into();
 
             if spectrum.is_empty() || w < 2.0 || h < 2.0 {
-                return (bounds, Vec::new(), ch);
+                return (bounds, Vec::new(), ch, band_hue, use_channel_hue);
             }
 
             // Log-scale the magnitudes for better visibility
@@ -1325,10 +1395,16 @@ fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
                 })
                 .collect();
 
-            (bounds, bars, ch)
+            (bounds, bars, ch, band_hue, use_channel_hue)
         },
         move |_bounds: Bounds<Pixels>,
-              (bounds, bars, ch): (Bounds<Pixels>, Vec<(f32, f32, f32, f32)>, usize),
+              (bounds, bars, ch, band_hue, use_channel_hue): (
+                  Bounds<Pixels>,
+                  Vec<(f32, f32, f32, f32)>,
+                  usize,
+                  f32,
+                  bool,
+              ),
               window: &mut Window,
               _cx: &mut App| {
             // Background
@@ -1339,9 +1415,11 @@ fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
                 gpui::BorderStyle::Solid,
             ));
 
-            // Channel label (draw as a small colored indicator in top-left)
-            // Hue varies by channel for visual distinction
-            let hue = (ch as f32 / 64.0) * 0.8;
+            let hue = if use_channel_hue {
+                (ch as f32 / 64.0) * 0.8
+            } else {
+                band_hue
+            };
 
             for &(x, y, w, h) in &bars {
                 if h < 0.5 {
@@ -1431,6 +1509,40 @@ impl MindDaw {
         let cols = 8;
         let rows = 8;
         let selected = self.selected_channel;
+        let band = self.spectrum_band;
+
+        // Band toggle buttons
+        let bands = [
+            BrainWaveBand::All,
+            BrainWaveBand::Delta,
+            BrainWaveBand::Theta,
+            BrainWaveBand::Alpha,
+            BrainWaveBand::Beta,
+            BrainWaveBand::Gamma,
+        ];
+        let mut band_bar = div().flex().gap_1().mb_2();
+        for b in bands {
+            let (lo, hi) = b.freq_range();
+            let sublabel = if b == BrainWaveBand::All {
+                String::new()
+            } else {
+                format!(" ({lo:.0}–{hi:.0} Hz)")
+            };
+            let label = format!("{}{sublabel}", b.label());
+            let btn = if band == b {
+                Button::new(SharedString::from(format!("band-{}", b.label())))
+                    .label(label)
+                    .primary()
+            } else {
+                Button::new(SharedString::from(format!("band-{}", b.label())))
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.spectrum_band = b;
+                        cx.notify();
+                    }))
+            };
+            band_bar = band_bar.child(btn);
+        }
 
         let mut grid = div().flex().flex_col().gap(px(2.0));
 
@@ -1459,7 +1571,7 @@ impl MindDaw {
                             })
                             .child(format!("Ch{ch}")),
                     )
-                    .child(spectrum_canvas(&data, ch));
+                    .child(spectrum_canvas(&data, ch, band));
 
                 if is_selected {
                     cell = cell
@@ -1473,7 +1585,7 @@ impl MindDaw {
             grid = grid.child(row_div);
         }
 
-        grid
+        div().flex().flex_col().child(band_bar).child(grid)
     }
 
     fn render_word_read_view(&mut self, cx: &mut Context<Self>) -> Div {
