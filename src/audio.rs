@@ -23,7 +23,7 @@ pub struct AudioHandle {
 
 // ── Sonification pipeline ────────────────────────────────────────────────────
 
-const BINS_PER_CHANNEL: usize = 8;
+const BINS_PER_CHANNEL: usize = 32;
 const AUDIO_FFT_SIZE: usize = 4096;
 /// 3-octave range: C3 to C6
 const BASE_FREQ: f32 = 130.81;
