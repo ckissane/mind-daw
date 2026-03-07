@@ -1,9 +1,11 @@
 mod audio;
 mod cognionics;
 mod streams;
+mod word_read;
 
 use audio::{AudioCommand, AudioHandle, EegFrame};
 use cognionics::{CogCommand, CogHandle, CogState};
+use word_read::WordReadState;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{ActiveTheme, Disableable, Root};
@@ -16,6 +18,7 @@ enum Tab {
     Waves,
     Spectrum,
     Pca,
+    Words,
 }
 
 /// Application state.
@@ -44,11 +47,14 @@ struct MindDaw {
     pca_dragging: bool,
     pca_last_drag_pos: Option<Point<Pixels>>,
 
+    // Word reading
+    word_read_state: WordReadState,
+
     // UI
     active_tab: Tab,
 }
 
-const COG_BUFFER_CAPACITY: usize = 512;
+const COG_BUFFER_CAPACITY: usize = 150;
 
 // PCA constants
 const PCA_FFT_SIZE: usize = 64;
@@ -171,6 +177,22 @@ impl PcaState {
     }
 }
 
+/// Clip outliers to the 5th–95th percentile range (90% central range).
+fn clip_outliers(data: &mut [f32]) {
+    if data.len() < 2 {
+        return;
+    }
+    let mut sorted: Vec<f32> = data.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo = sorted[sorted.len() * 5 / 100];
+    let hi = sorted[sorted.len() * 95 / 100];
+    if lo < hi {
+        for v in data.iter_mut() {
+            *v = v.clamp(lo, hi);
+        }
+    }
+}
+
 fn compute_pca_feature_vector(channel_data: &[Vec<f32>]) -> Vec<f32> {
     let mut feature = Vec::with_capacity(PCA_DIM);
     let mut planner = FftPlanner::new();
@@ -244,6 +266,8 @@ impl MindDaw {
             pca_dragging: false,
             pca_last_drag_pos: None,
 
+            word_read_state: WordReadState::new(),
+
             active_tab: Tab::Spectrum,
         }
     }
@@ -277,7 +301,7 @@ impl MindDaw {
                 // Start polling loop for pulling samples (~30fps)
                 cx.spawn(async |this, cx| {
                     loop {
-                        smol::Timer::after(std::time::Duration::from_millis(33)).await;
+                        smol::Timer::after(std::time::Duration::from_millis(16)).await;
 
                         let ok = this
                             .update(cx, |this, cx| {
@@ -433,6 +457,7 @@ impl MindDaw {
         self.pca_pitch = 0.0;
         self.pca_dragging = false;
         self.pca_last_drag_pos = None;
+        self.word_read_state = WordReadState::new();
         cx.notify();
     }
 
@@ -440,7 +465,7 @@ impl MindDaw {
     fn start_cog_poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async |this, cx| {
             loop {
-                smol::Timer::after(std::time::Duration::from_millis(33)).await;
+                smol::Timer::after(std::time::Duration::from_millis(16)).await;
 
                 let ok = this
                     .update(cx, |this, cx| {
@@ -475,7 +500,11 @@ impl MindDaw {
                             this.cog_waveform_data = this
                                 .cog_buffer
                                 .iter()
-                                .map(|buf| buf.iter().copied().collect())
+                                .map(|buf| {
+                                    let mut ch: Vec<f32> = buf.iter().copied().collect();
+                                    clip_outliers(&mut ch);
+                                    ch
+                                })
                                 .collect();
 
                             this.send_audio_frame_from_cog();
@@ -487,6 +516,9 @@ impl MindDaw {
                             if !this.pca_dragging {
                                 this.pca_yaw += 0.005;
                             }
+
+                            // Word reading update
+                            this.word_read_state.tick(&features);
 
                             cx.notify();
                         }
@@ -694,7 +726,7 @@ impl MindDaw {
                                             .w(px(32.0))
                                             .child(format!("Ch{ch}")),
                                     )
-                                    .child(waveform_canvas(data))
+                                    .child(waveform_canvas(data, meta.sample_rate as f32))
                                     .into_any_element()
                             })
                             .collect::<Vec<_>>(),
@@ -850,33 +882,52 @@ impl MindDaw {
                             cx.notify();
                         }))
                 };
+                let words_btn = if active_tab == Tab::Words {
+                    Button::new("tab-words").label("Words").primary()
+                } else {
+                    Button::new("tab-words")
+                        .label("Words")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.active_tab = Tab::Words;
+                            cx.notify();
+                        }))
+                };
 
-                let content: Div = if active_tab == Tab::Pca {
+                let content: Div = if active_tab == Tab::Words {
+                    self.render_word_read_view(cx)
+                } else if active_tab == Tab::Pca {
                     self.render_pca_view(cx)
                 } else if active_tab == Tab::Spectrum {
                     self.render_spectrum_grid(cog_waveform_data, cx)
                 } else {
-                    div().flex().flex_col().gap_1().children(
-                        cog_waveform_data
-                            .iter()
-                            .enumerate()
-                            .map(|(ch, data)| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .w(px(32.0))
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("Ch{ch}")),
-                                    )
-                                    .child(waveform_canvas(data))
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                    let half = (cog_waveform_data.len() + 1) / 2;
+                    let make_col = |items: &[Vec<f32>], start: usize| {
+                        div().flex().flex_col().flex_1().gap_1().children(
+                            items
+                                .iter()
+                                .enumerate()
+                                .map(|(i, data)| {
+                                    let ch = start + i;
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .w(px(32.0))
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!("Ch{ch}")),
+                                        )
+                                        .child(waveform_canvas(data, 300.0))
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    div().flex().gap_4()
+                        .child(make_col(&cog_waveform_data[..half], 0))
+                        .child(make_col(&cog_waveform_data[half..], half))
                 };
 
                 panel
@@ -911,6 +962,7 @@ impl MindDaw {
                                 .child(waves_btn)
                                 .child(spectrum_btn)
                                 .child(pca_btn)
+                                .child(words_btn)
                                 .child(audio_btn)
                                 .child(
                                     Button::new("cog-disconnect")
@@ -1011,11 +1063,15 @@ struct WaveformPrepaint {
     points: Vec<(f32, f32)>,
     /// Pixel X positions of period markers (vertical bars).
     period_xs: Vec<f32>,
+    /// Pixel X positions of 0.5s time markers.
+    time_marker_xs: Vec<f32>,
+    /// Segments where adjacent samples are equal (disconnected signal).
+    flat_segments: Vec<(f32, f32, f32, f32)>,
 }
 
 /// Render an oscilloscope-style waveform trace using gpui canvas with stroked paths.
 /// Draws vertical bars at the detected autocorrelation period interval.
-fn waveform_canvas(data: &[f32]) -> impl IntoElement {
+fn waveform_canvas(data: &[f32], sample_rate: f32) -> impl IntoElement {
     let data = data.to_vec();
 
     canvas(
@@ -1029,6 +1085,8 @@ fn waveform_canvas(data: &[f32]) -> impl IntoElement {
                     bounds,
                     points: Vec::new(),
                     period_xs: Vec::new(),
+                    time_marker_xs: Vec::new(),
+                    flat_segments: Vec::new(),
                 };
             }
 
@@ -1069,10 +1127,51 @@ fn waveform_canvas(data: &[f32]) -> impl IntoElement {
                 Vec::new()
             };
 
+            // Detect flat segments (disconnected signal):
+            // 5 consecutive samples spanning <= 3% of range
+            let flat_tol = range * 0.03;
+            let mut flat = vec![false; display_samples.saturating_sub(1)];
+            for i in 4..display_samples {
+                let mut lo = f32::INFINITY;
+                let mut hi = f32::NEG_INFINITY;
+                for j in 0..5 {
+                    let v = data.get(offset + i - 4 + j).copied().unwrap_or(0.0);
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+                if (hi - lo) <= flat_tol {
+                    for j in 0..4 {
+                        flat[i - 4 + j] = true;
+                    }
+                }
+            }
+            let flat_segments: Vec<(f32, f32, f32, f32)> = flat
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| **f)
+                .map(|(i, _)| (points[i].0, points[i].1, points[i + 1].0, points[i + 1].1))
+                .collect();
+
+            // Compute 0.5s time marker X positions
+            let samples_per_half_sec = (sample_rate * 0.5) as usize;
+            let time_marker_xs = if samples_per_half_sec > 0 {
+                let mut xs = Vec::new();
+                let mut sample_pos = samples_per_half_sec;
+                while sample_pos < display_samples {
+                    xs.push(ox + sample_pos as f32 * samples_to_px);
+                    sample_pos += samples_per_half_sec;
+                }
+                xs
+            } else {
+                Vec::new()
+            };
+
             WaveformPrepaint {
                 bounds,
                 points,
                 period_xs,
+                time_marker_xs,
+                flat_segments,
             }
         },
         move |_bounds: Bounds<Pixels>, state: WaveformPrepaint, window: &mut Window, _cx: &mut App| {
@@ -1108,7 +1207,17 @@ fn waveform_canvas(data: &[f32]) -> impl IntoElement {
                 marker.move_to(point(px(x), px(oy)));
                 marker.line_to(point(px(x), px(oy + h)));
                 if let Ok(path) = marker.build() {
-                    window.paint_path(path, gpui::hsla(0.6, 0.5, 0.45, 0.5)); // blue-ish, semi-transparent
+                    window.paint_path(path, gpui::hsla(0.6, 0.5, 0.45, 0.5));
+                }
+            }
+
+            // Draw 0.5s time markers
+            for &x in &state.time_marker_xs {
+                let mut marker = PathBuilder::stroke(px(1.0));
+                marker.move_to(point(px(x), px(oy)));
+                marker.line_to(point(px(x), px(oy + h)));
+                if let Ok(path) = marker.build() {
+                    window.paint_path(path, gpui::hsla(0.0, 0.0, 0.35, 0.6));
                 }
             }
 
@@ -1120,6 +1229,16 @@ fn waveform_canvas(data: &[f32]) -> impl IntoElement {
             }
             if let Ok(path) = builder.build() {
                 window.paint_path(path, gpui::hsla(0.33, 0.9, 0.55, 1.0)); // green trace
+            }
+
+            // Draw flat (disconnected) segments in red over the green trace
+            for &(x1, y1, x2, y2) in &state.flat_segments {
+                let mut builder = PathBuilder::stroke(px(2.0));
+                builder.move_to(point(px(x1), px(y1)));
+                builder.line_to(point(px(x2), px(y2)));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, gpui::hsla(0.0, 0.9, 0.5, 1.0));
+                }
             }
         },
     )
@@ -1356,6 +1475,177 @@ impl MindDaw {
 
         grid
     }
+
+    fn render_word_read_view(&mut self, cx: &mut Context<Self>) -> Div {
+        use word_read::TrainingPhase;
+
+        let phase = self.word_read_state.phase;
+        let is_streaming = matches!(self.cog_state, CogState::Streaming);
+
+        // Training area
+        let training_box = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .min_h(px(160.0));
+
+        let training_area = match phase {
+            TrainingPhase::Idle => {
+                let btn = if is_streaming {
+                    Button::new("start-training")
+                        .primary()
+                        .label("Start Training")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.word_read_state.start_training();
+                            cx.notify();
+                        }))
+                } else {
+                    Button::new("start-training")
+                        .label("Start Training")
+                        .disabled(true)
+                };
+
+                training_box
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(cx.theme().foreground)
+                            .child("Word Training"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .mt_2()
+                            .child("Focus on each word as it appears"),
+                    )
+                    .child(div().mt_4().child(btn))
+            }
+
+            TrainingPhase::ShowingWord => {
+                let word = self
+                    .word_read_state
+                    .current_word()
+                    .unwrap_or("")
+                    .to_string();
+                let progress = self.word_read_state.progress();
+                let trained = self.word_read_state.words_trained;
+                let idx = self.word_read_state.current_word_idx;
+                let loop_num = trained / 20;
+
+                let stop_btn = Button::new("stop-training")
+                    .danger()
+                    .label("Stop")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.word_read_state.phase = word_read::TrainingPhase::Idle;
+                        this.word_read_state.word_shown_at = None;
+                        cx.notify();
+                    }));
+
+                training_box
+                    .child(
+                        div()
+                            .text_3xl()
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .text_color(gpui::hsla(0.58, 0.8, 0.7, 1.0))
+                            .child(word),
+                    )
+                    .child(
+                        div()
+                            .mt_4()
+                            .w_full()
+                            .max_w(px(400.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("word {}/{} — loop {}", idx + 1, 20, loop_num + 1)),
+                            )
+                            .child(
+                                div()
+                                    .h(px(6.0))
+                                    .w_full()
+                                    .rounded(px(3.0))
+                                    .bg(gpui::hsla(0.0, 0.0, 0.15, 1.0))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .rounded(px(3.0))
+                                            .bg(gpui_component::green_500())
+                                            .w(px(400.0 * progress)),
+                                    ),
+                            ),
+                    )
+                    .child(div().mt_3().child(stop_btn))
+            }
+
+        };
+
+        // Prediction bar (always visible)
+        let predictions = &self.word_read_state.top_predictions;
+        let mut pred_row = div().flex().gap_4().items_end();
+
+        for (i, (word, score)) in predictions.iter().enumerate() {
+            let brightness = 0.9 - i as f32 * 0.12;
+            let font_size = if i == 0 { px(20.0) } else { px(14.0) };
+            pred_row = pred_row.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(font_size)
+                            .font_weight(if i == 0 {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(gpui::hsla(0.58, 0.7, brightness, 1.0))
+                            .child(word.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{score:.2}")),
+                    ),
+            );
+        }
+
+        let prediction_bar = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Mind Reading — Top 5 Predictions"),
+            )
+            .child(pred_row);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(training_area)
+            .child(prediction_bar)
+    }
 }
 
 fn rotate_y(p: [f32; 3], angle: f32) -> [f32; 3] {
@@ -1523,7 +1813,20 @@ fn pca_sphere_canvas(
                 }
             }
 
-            // Trail points
+            // Trail segments + points
+            for pair in state.trail_points.windows(2) {
+                let (x1, y1, d1, age1) = pair[0];
+                let (x2, y2, d2, age2) = pair[1];
+                let avg_depth = ((d1 + d2) / 2.0 + 1.0) / 2.0;
+                let avg_age = (age1 + age2) / 2.0;
+                let alpha = avg_age * (0.3 + 0.7 * avg_depth);
+                let mut builder = PathBuilder::stroke(px(1.5));
+                builder.move_to(point(px(x1), px(y1)));
+                builder.line_to(point(px(x2), px(y2)));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, gpui::hsla(0.33, 0.8, 0.5, alpha));
+                }
+            }
             for &(sx, sy, depth, age_factor) in &state.trail_points {
                 let depth_factor = (depth + 1.0) / 2.0;
                 let alpha = age_factor * (0.3 + 0.7 * depth_factor);
