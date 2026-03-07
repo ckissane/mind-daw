@@ -15,6 +15,7 @@ use streams::{PairedStream, StreamMeta};
 enum Tab {
     Waves,
     Spectrum,
+    Pca,
 }
 
 /// Application state.
@@ -36,11 +37,188 @@ struct MindDaw {
     audio_enabled: bool,
     selected_channel: Option<usize>,
 
+    // PCA
+    pca_state: PcaState,
+    pca_yaw: f32,
+    pca_pitch: f32,
+    pca_dragging: bool,
+    pca_last_drag_pos: Option<Point<Pixels>>,
+
     // UI
     active_tab: Tab,
 }
 
 const COG_BUFFER_CAPACITY: usize = 512;
+
+// PCA constants
+const PCA_FFT_SIZE: usize = 64;
+const PCA_BINS: usize = PCA_FFT_SIZE / 2;
+const PCA_DIM: usize = 64 * PCA_BINS; // 2048
+const PCA_K: usize = 3;
+const PCA_TRAIL_LEN: usize = 128;
+
+struct PcaState {
+    weights: Vec<Vec<f32>>,
+    mean: Vec<f32>,
+    sample_count: u64,
+    trail: VecDeque<[f32; 3]>,
+    current_point: [f32; 3],
+    y_ema: [f32; 3],
+    y_var: [f32; 3],
+}
+
+impl PcaState {
+    fn new() -> Self {
+        let mut weights = vec![vec![0.0f32; PCA_DIM]; PCA_K];
+        let spread = [0, PCA_DIM / 3, 2 * PCA_DIM / 3];
+        for j in 0..PCA_K {
+            weights[j][spread[j]] = 1.0;
+        }
+        Self {
+            weights,
+            mean: vec![0.0f32; PCA_DIM],
+            sample_count: 0,
+            trail: VecDeque::with_capacity(PCA_TRAIL_LEN),
+            current_point: [0.0; 3],
+            y_ema: [0.0; 3],
+            y_var: [0.0; 3],
+        }
+    }
+
+    fn update(&mut self, x_raw: &[f32]) {
+        if x_raw.len() != PCA_DIM {
+            return;
+        }
+
+        self.sample_count += 1;
+        let count = self.sample_count;
+
+        // 1. Update running mean via EMA
+        let alpha = if count <= 100 {
+            1.0 / count as f32
+        } else {
+            0.01
+        };
+        for i in 0..PCA_DIM {
+            self.mean[i] += alpha * (x_raw[i] - self.mean[i]);
+        }
+
+        // 2. Center input
+        let x: Vec<f32> = (0..PCA_DIM).map(|i| x_raw[i] - self.mean[i]).collect();
+
+        // 3. Compute projections
+        let mut y = [0.0f32; PCA_K];
+        for j in 0..PCA_K {
+            y[j] = self.weights[j]
+                .iter()
+                .zip(x.iter())
+                .map(|(w, xi)| w * xi)
+                .sum();
+        }
+
+        // 4. Sanger's rule with progressive deflation
+        let eta = 0.01 / (1.0 + count as f32 * 0.0001);
+        let old_weights: Vec<Vec<f32>> = self.weights.clone();
+        let mut x_res = x;
+        for j in 0..PCA_K {
+            for i in 0..PCA_DIM {
+                self.weights[j][i] += eta * y[j] * x_res[i];
+            }
+            for i in 0..PCA_DIM {
+                x_res[i] -= y[j] * self.weights[j][i];
+            }
+        }
+
+        // 5. Normalize each weight vector
+        for j in 0..PCA_K {
+            let norm: f32 = self.weights[j].iter().map(|w| w * w).sum::<f32>().sqrt();
+            if norm > 1e-10 {
+                for w in &mut self.weights[j] {
+                    *w /= norm;
+                }
+            }
+        }
+
+        // 6. Sign correction
+        for j in 0..PCA_K {
+            let dot: f32 = self.weights[j]
+                .iter()
+                .zip(old_weights[j].iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            if dot < 0.0 {
+                for w in &mut self.weights[j] {
+                    *w = -*w;
+                }
+                y[j] = -y[j];
+            }
+        }
+
+        // 7. Adaptive projection scaling: per-component EMA + tanh compression
+        let alpha_y = 0.02f32;
+        let mut pt = [0.0f32; 3];
+        for j in 0..3 {
+            self.y_ema[j] += alpha_y * (y[j] - self.y_ema[j]);
+            let diff = y[j] - self.y_ema[j];
+            self.y_var[j] += alpha_y * (diff * diff - self.y_var[j]);
+            pt[j] = ((y[j] - self.y_ema[j]) / self.y_var[j].sqrt().max(1e-6)).tanh();
+        }
+        self.current_point = pt;
+        if self.trail.len() >= PCA_TRAIL_LEN {
+            self.trail.pop_front();
+        }
+        self.trail.push_back(pt);
+    }
+}
+
+fn compute_pca_feature_vector(channel_data: &[Vec<f32>]) -> Vec<f32> {
+    let mut feature = Vec::with_capacity(PCA_DIM);
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(PCA_FFT_SIZE);
+
+    for ch in 0..64 {
+        let data = channel_data.get(ch).map(|v| v.as_slice()).unwrap_or(&[]);
+        let mut buf: Vec<Complex<f32>> = vec![Complex::default(); PCA_FFT_SIZE];
+        let n = data.len().min(PCA_FFT_SIZE);
+        let start = data.len().saturating_sub(PCA_FFT_SIZE);
+        for i in 0..n {
+            let w = (std::f32::consts::PI * i as f32 / PCA_FFT_SIZE as f32)
+                .sin()
+                .powi(2);
+            buf[i] = Complex::new(data[start + i] * w, 0.0);
+        }
+        fft.process(&mut buf);
+
+        for i in 0..PCA_BINS {
+            feature.push(buf[i].norm());
+        }
+    }
+
+    // Debias: log-compress, per-channel mean subtraction, then L2 normalize
+    for ch_block in feature.chunks_mut(PCA_BINS) {
+        // Log-compress to shrink dynamic range
+        for v in ch_block.iter_mut() {
+            *v = (1.0 + *v).ln();
+        }
+        // Subtract channel mean so PCA sees shape, not absolute power
+        let mean = ch_block.iter().sum::<f32>() / PCA_BINS as f32;
+        for v in ch_block.iter_mut() {
+            *v -= mean;
+        }
+    }
+
+    // L2-normalize the full vector: removes the correlated global amplitude
+    // factor that causes all 3 PCA components to track the same thing.
+    // In 2048 dims, direction still carries rich spectral-shape information.
+    let norm = feature.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 1e-10 {
+        for v in &mut feature {
+            *v /= norm;
+        }
+    }
+
+    feature
+}
 
 impl MindDaw {
     fn new() -> Self {
@@ -59,6 +237,12 @@ impl MindDaw {
             audio_handle: None,
             audio_enabled: false,
             selected_channel: None,
+
+            pca_state: PcaState::new(),
+            pca_yaw: 0.0,
+            pca_pitch: 0.0,
+            pca_dragging: false,
+            pca_last_drag_pos: None,
 
             active_tab: Tab::Spectrum,
         }
@@ -244,6 +428,11 @@ impl MindDaw {
             buf.clear();
         }
         self.cog_waveform_data.clear();
+        self.pca_state = PcaState::new();
+        self.pca_yaw = 0.0;
+        self.pca_pitch = 0.0;
+        self.pca_dragging = false;
+        self.pca_last_drag_pos = None;
         cx.notify();
     }
 
@@ -290,6 +479,15 @@ impl MindDaw {
                                 .collect();
 
                             this.send_audio_frame_from_cog();
+
+                            // PCA update
+                            let features =
+                                compute_pca_feature_vector(&this.cog_waveform_data);
+                            this.pca_state.update(&features);
+                            if !this.pca_dragging {
+                                this.pca_yaw += 0.005;
+                            }
+
                             cx.notify();
                         }
 
@@ -642,8 +840,20 @@ impl MindDaw {
                             cx.notify();
                         }))
                 };
+                let pca_btn = if active_tab == Tab::Pca {
+                    Button::new("tab-pca").label("PCA").primary()
+                } else {
+                    Button::new("tab-pca")
+                        .label("PCA")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.active_tab = Tab::Pca;
+                            cx.notify();
+                        }))
+                };
 
-                let content: Div = if active_tab == Tab::Spectrum {
+                let content: Div = if active_tab == Tab::Pca {
+                    self.render_pca_view(cx)
+                } else if active_tab == Tab::Spectrum {
                     self.render_spectrum_grid(cog_waveform_data, cx)
                 } else {
                     div().flex().flex_col().gap_1().children(
@@ -700,6 +910,7 @@ impl MindDaw {
                                 .gap_2()
                                 .child(waves_btn)
                                 .child(spectrum_btn)
+                                .child(pca_btn)
                                 .child(audio_btn)
                                 .child(
                                     Button::new("cog-disconnect")
@@ -1030,6 +1241,68 @@ fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
 }
 
 impl MindDaw {
+    fn render_pca_view(&mut self, cx: &mut Context<Self>) -> Div {
+        let sphere = pca_sphere_canvas(
+            self.pca_state.current_point,
+            &self.pca_state.trail,
+            self.pca_yaw,
+            self.pca_pitch,
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "Running PCA: {} samples | {} dims -> 3D",
+                        self.pca_state.sample_count, PCA_DIM,
+                    )),
+            )
+            .child(
+                div()
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
+                            this.pca_dragging = true;
+                            this.pca_last_drag_pos = Some(event.position);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                        if this.pca_dragging {
+                            if let Some(last) = this.pca_last_drag_pos {
+                                let dx: f32 = (event.position.x - last.x).into();
+                                let dy: f32 = (event.position.y - last.y).into();
+                                this.pca_yaw += dx * 0.01;
+                                this.pca_pitch = (this.pca_pitch + dy * 0.01)
+                                    .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
+                                this.pca_last_drag_pos = Some(event.position);
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _window, _cx| {
+                            this.pca_dragging = false;
+                            this.pca_last_drag_pos = None;
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _window, _cx| {
+                            this.pca_dragging = false;
+                            this.pca_last_drag_pos = None;
+                        }),
+                    )
+                    .child(sphere),
+            )
+    }
+
     /// Render the 8x8 spectrum grid for all 64 channels.
     fn render_spectrum_grid(
         &mut self,
@@ -1083,6 +1356,216 @@ impl MindDaw {
 
         grid
     }
+}
+
+fn rotate_y(p: [f32; 3], angle: f32) -> [f32; 3] {
+    let (s, c) = angle.sin_cos();
+    [p[0] * c + p[2] * s, p[1], -p[0] * s + p[2] * c]
+}
+
+fn rotate_x(p: [f32; 3], angle: f32) -> [f32; 3] {
+    let (s, c) = angle.sin_cos();
+    [p[0], p[1] * c - p[2] * s, p[1] * s + p[2] * c]
+}
+
+fn project_ortho(p: [f32; 3], cx: f32, cy: f32, radius: f32) -> (f32, f32, f32) {
+    (cx + p[0] * radius, cy - p[1] * radius, p[2])
+}
+
+struct PcaPrepaint {
+    bounds: Bounds<Pixels>,
+    lat_lines: Vec<Vec<(f32, f32, f32)>>,
+    lon_lines: Vec<Vec<(f32, f32, f32)>>,
+    trail_points: Vec<(f32, f32, f32, f32)>,
+    current_point: Option<(f32, f32)>,
+}
+
+fn pca_sphere_canvas(
+    current_point: [f32; 3],
+    trail: &VecDeque<[f32; 3]>,
+    yaw: f32,
+    pitch: f32,
+) -> impl IntoElement {
+    let trail: Vec<[f32; 3]> = trail.iter().copied().collect();
+
+    canvas(
+        move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+            let w: f32 = bounds.size.width.into();
+            let h: f32 = bounds.size.height.into();
+            let ox: f32 = bounds.origin.x.into();
+            let oy: f32 = bounds.origin.y.into();
+            let center_x = ox + w / 2.0;
+            let center_y = oy + h / 2.0;
+            let radius = (w.min(h) / 2.0) * 0.85;
+
+            let segments = 48;
+            let rotate = |p: [f32; 3]| rotate_x(rotate_y(p, yaw), pitch);
+
+            // Generate latitude circles (7)
+            let mut lat_lines = Vec::new();
+            for lat_i in 1..=7 {
+                let phi = std::f32::consts::PI * lat_i as f32 / 8.0;
+                let r = phi.sin();
+                let y_pos = phi.cos();
+                let mut line = Vec::new();
+                for seg in 0..=segments {
+                    let theta =
+                        2.0 * std::f32::consts::PI * seg as f32 / segments as f32;
+                    let p = [r * theta.cos(), y_pos, r * theta.sin()];
+                    let rotated = rotate(p);
+                    let (sx, sy, depth) =
+                        project_ortho(rotated, center_x, center_y, radius);
+                    line.push((sx, sy, depth));
+                }
+                lat_lines.push(line);
+            }
+
+            // Generate longitude meridians (12)
+            let mut lon_lines = Vec::new();
+            for lon_i in 0..12 {
+                let theta =
+                    2.0 * std::f32::consts::PI * lon_i as f32 / 12.0;
+                let mut line = Vec::new();
+                for seg in 0..=segments {
+                    let phi =
+                        std::f32::consts::PI * seg as f32 / segments as f32;
+                    let p = [
+                        phi.sin() * theta.cos(),
+                        phi.cos(),
+                        phi.sin() * theta.sin(),
+                    ];
+                    let rotated = rotate(p);
+                    let (sx, sy, depth) =
+                        project_ortho(rotated, center_x, center_y, radius);
+                    line.push((sx, sy, depth));
+                }
+                lon_lines.push(line);
+            }
+
+            // Project trail points
+            let trail_len = trail.len();
+            let trail_points: Vec<(f32, f32, f32, f32)> = trail
+                .iter()
+                .enumerate()
+                .map(|(i, &pt)| {
+                    let rotated = rotate(pt);
+                    let (sx, sy, depth) =
+                        project_ortho(rotated, center_x, center_y, radius);
+                    let age_factor = (i + 1) as f32 / trail_len.max(1) as f32;
+                    (sx, sy, depth, age_factor)
+                })
+                .collect();
+
+            // Project current point
+            let rotated = rotate(current_point);
+            let (sx, sy, _depth) =
+                project_ortho(rotated, center_x, center_y, radius);
+            let cp = if current_point[0] != 0.0
+                || current_point[1] != 0.0
+                || current_point[2] != 0.0
+            {
+                Some((sx, sy))
+            } else {
+                None
+            };
+
+            PcaPrepaint {
+                bounds,
+                lat_lines,
+                lon_lines,
+                trail_points,
+                current_point: cp,
+            }
+        },
+        move |_bounds: Bounds<Pixels>,
+              state: PcaPrepaint,
+              window: &mut Window,
+              _cx: &mut App| {
+            let bounds = state.bounds;
+
+            // Dark background + outline
+            window.paint_quad(gpui::fill(bounds, gpui::hsla(0.0, 0.0, 0.06, 1.0)));
+            window.paint_quad(gpui::outline(
+                bounds,
+                gpui::hsla(0.0, 0.0, 0.2, 1.0),
+                gpui::BorderStyle::Solid,
+            ));
+
+            // Wireframe: latitude circles
+            for line in &state.lat_lines {
+                for pair in line.windows(2) {
+                    let (x1, y1, d1) = pair[0];
+                    let (x2, y2, d2) = pair[1];
+                    let avg_depth = (d1 + d2) / 2.0;
+                    let alpha = 0.15 + 0.15 * (avg_depth + 1.0) / 2.0;
+                    let mut builder = PathBuilder::stroke(px(0.5));
+                    builder.move_to(point(px(x1), px(y1)));
+                    builder.line_to(point(px(x2), px(y2)));
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, gpui::hsla(0.58, 0.2, 0.5, alpha));
+                    }
+                }
+            }
+
+            // Wireframe: longitude meridians
+            for line in &state.lon_lines {
+                for pair in line.windows(2) {
+                    let (x1, y1, d1) = pair[0];
+                    let (x2, y2, d2) = pair[1];
+                    let avg_depth = (d1 + d2) / 2.0;
+                    let alpha = 0.15 + 0.15 * (avg_depth + 1.0) / 2.0;
+                    let mut builder = PathBuilder::stroke(px(0.5));
+                    builder.move_to(point(px(x1), px(y1)));
+                    builder.line_to(point(px(x2), px(y2)));
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, gpui::hsla(0.58, 0.2, 0.5, alpha));
+                    }
+                }
+            }
+
+            // Trail points
+            for &(sx, sy, depth, age_factor) in &state.trail_points {
+                let depth_factor = (depth + 1.0) / 2.0;
+                let alpha = age_factor * (0.3 + 0.7 * depth_factor);
+                let sz = 3.0;
+                let trail_bounds = Bounds {
+                    origin: point(px(sx - sz / 2.0), px(sy - sz / 2.0)),
+                    size: size(px(sz), px(sz)),
+                };
+                window.paint_quad(gpui::fill(
+                    trail_bounds,
+                    gpui::hsla(0.33, 0.8, 0.5, alpha),
+                ));
+            }
+
+            // Current point
+            if let Some((sx, sy)) = state.current_point {
+                // Glow halo
+                let glow_sz = 14.0;
+                let glow_bounds = Bounds {
+                    origin: point(px(sx - glow_sz / 2.0), px(sy - glow_sz / 2.0)),
+                    size: size(px(glow_sz), px(glow_sz)),
+                };
+                window.paint_quad(gpui::fill(
+                    glow_bounds,
+                    gpui::hsla(0.33, 0.9, 0.6, 0.3),
+                ));
+
+                // Bright dot
+                let dot_sz = 8.0;
+                let dot_bounds = Bounds {
+                    origin: point(px(sx - dot_sz / 2.0), px(sy - dot_sz / 2.0)),
+                    size: size(px(dot_sz), px(dot_sz)),
+                };
+                window.paint_quad(gpui::fill(
+                    dot_bounds,
+                    gpui::hsla(0.33, 0.9, 0.7, 1.0),
+                ));
+            }
+        },
+    )
+    .w_full()
+    .h(px(400.0))
 }
 
 fn main() {
