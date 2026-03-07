@@ -1119,10 +1119,61 @@ fn autocorrelate_analysis(data: &[f32], display_len: usize) -> (usize, usize) {
     (best_offset, period)
 }
 
+/// Decompose a signal into brain wave frequency bands via FFT bandpass + IFFT.
+/// Returns (reconstructed_signal, hue) for each of the 5 bands.
+fn decompose_into_bands(data: &[f32], sample_rate: f32) -> Vec<(Vec<f32>, f32)> {
+    use rustfft::num_complex::Complex;
+
+    let n = data.len();
+    if n < 4 {
+        return Vec::new();
+    }
+
+    let mut planner = FftPlanner::new();
+    let fft_fwd = planner.plan_fft_forward(n);
+
+    let mut buf: Vec<Complex<f32>> = data.iter().map(|&v| Complex::new(v, 0.0)).collect();
+    fft_fwd.process(&mut buf);
+
+    let bin_hz = sample_rate / n as f32;
+    let scale = 1.0 / n as f32;
+
+    let bands: [(f32, f32, f32); 5] = [
+        (0.5, 4.0, BrainWaveBand::Delta.hue()),
+        (4.0, 8.0, BrainWaveBand::Theta.hue()),
+        (8.0, 13.0, BrainWaveBand::Alpha.hue()),
+        (13.0, 30.0, BrainWaveBand::Beta.hue()),
+        (30.0, 80.0, BrainWaveBand::Gamma.hue()),
+    ];
+
+    bands
+        .iter()
+        .map(|&(lo, hi, hue)| {
+            let mut filtered = vec![Complex::new(0.0, 0.0); n];
+            for k in 0..n {
+                let freq = if k <= n / 2 {
+                    k as f32 * bin_hz
+                } else {
+                    (n - k) as f32 * bin_hz
+                };
+                if freq >= lo && freq < hi {
+                    filtered[k] = buf[k];
+                }
+            }
+            let fft_inv = planner.plan_fft_inverse(n);
+            fft_inv.process(&mut filtered);
+            let signal: Vec<f32> = filtered.iter().map(|c| c.re * scale).collect();
+            (signal, hue)
+        })
+        .collect()
+}
+
 /// Prepaint state for waveform canvas.
 struct WaveformPrepaint {
     bounds: Bounds<Pixels>,
     points: Vec<(f32, f32)>,
+    /// Per-band reconstructed traces: (points, hue).
+    band_traces: Vec<(Vec<(f32, f32)>, f32)>,
     /// Pixel X positions of period markers (vertical bars).
     period_xs: Vec<f32>,
     /// Pixel X positions of 0.5s time markers.
@@ -1135,6 +1186,7 @@ struct WaveformPrepaint {
 /// Draws vertical bars at the detected autocorrelation period interval.
 fn waveform_canvas(data: &[f32], sample_rate: f32) -> impl IntoElement {
     let data = data.to_vec();
+    let bands = decompose_into_bands(&data, sample_rate);
 
     canvas(
         move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
@@ -1146,6 +1198,7 @@ fn waveform_canvas(data: &[f32], sample_rate: f32) -> impl IntoElement {
                 return WaveformPrepaint {
                     bounds,
                     points: Vec::new(),
+                    band_traces: Vec::new(),
                     period_xs: Vec::new(),
                     time_marker_xs: Vec::new(),
                     flat_segments: Vec::new(),
@@ -1160,6 +1213,7 @@ fn waveform_canvas(data: &[f32], sample_rate: f32) -> impl IntoElement {
             let min_val = slice.iter().copied().fold(f32::INFINITY, f32::min);
             let max_val = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let range = (max_val - min_val).max(1e-10);
+            let mid_val = (min_val + max_val) / 2.0;
 
             let padding = 2.0f32;
             let draw_h = h - padding * 2.0;
@@ -1173,6 +1227,25 @@ fn waveform_canvas(data: &[f32], sample_rate: f32) -> impl IntoElement {
                     let norm = (val - min_val) / range;
                     let y = oy + padding + draw_h * (1.0 - norm);
                     (x, y)
+                })
+                .collect();
+
+            // Compute band trace points (centered around mid, same scale as raw)
+            let band_traces: Vec<(Vec<(f32, f32)>, f32)> = bands
+                .iter()
+                .map(|(signal, hue)| {
+                    let pts: Vec<(f32, f32)> = (0..display_samples)
+                        .map(|i| {
+                            let idx = offset + i;
+                            let val = signal.get(idx).copied().unwrap_or(0.0);
+                            let x = ox + i as f32 * samples_to_px;
+                            // Band signal is zero-centered; map relative to midpoint of raw range
+                            let norm = (mid_val + val - min_val) / range;
+                            let y = oy + padding + draw_h * (1.0 - norm);
+                            (x, y)
+                        })
+                        .collect();
+                    (pts, *hue)
                 })
                 .collect();
 
@@ -1231,6 +1304,7 @@ fn waveform_canvas(data: &[f32], sample_rate: f32) -> impl IntoElement {
             WaveformPrepaint {
                 bounds,
                 points,
+                band_traces,
                 period_xs,
                 time_marker_xs,
                 flat_segments,
@@ -1283,17 +1357,32 @@ fn waveform_canvas(data: &[f32], sample_rate: f32) -> impl IntoElement {
                 }
             }
 
-            // Draw the waveform trace
-            let mut builder = PathBuilder::stroke(px(1.5));
+            // Draw the raw waveform trace (dimmed)
+            let mut builder = PathBuilder::stroke(px(1.0));
             builder.move_to(point(px(state.points[0].0), px(state.points[0].1)));
             for &(x, y) in &state.points[1..] {
                 builder.line_to(point(px(x), px(y)));
             }
             if let Ok(path) = builder.build() {
-                window.paint_path(path, gpui::hsla(0.33, 0.9, 0.55, 1.0)); // green trace
+                window.paint_path(path, gpui::hsla(0.0, 0.0, 0.4, 0.5));
             }
 
-            // Draw flat (disconnected) segments in red over the green trace
+            // Draw band-reconstructed traces
+            for (pts, hue) in &state.band_traces {
+                if pts.len() < 2 {
+                    continue;
+                }
+                let mut builder = PathBuilder::stroke(px(1.5));
+                builder.move_to(point(px(pts[0].0), px(pts[0].1)));
+                for &(x, y) in &pts[1..] {
+                    builder.line_to(point(px(x), px(y)));
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, gpui::hsla(*hue, 0.85, 0.55, 0.85));
+                }
+            }
+
+            // Draw flat (disconnected) segments in red over the traces
             for &(x1, y1, x2, y2) in &state.flat_segments {
                 let mut builder = PathBuilder::stroke(px(2.0));
                 builder.move_to(point(px(x1), px(y1)));
