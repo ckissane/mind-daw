@@ -17,6 +17,9 @@
           overlays = [ (import rust-overlay) ];
         };
 
+        isLinux = pkgs.stdenv.hostPlatform.isLinux;
+        isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
         };
@@ -25,6 +28,16 @@
 
         # System dependencies needed at build time
         buildInputs = with pkgs; [
+          # TLS
+          openssl
+
+          # Compression
+          zstd
+
+          # LSL (system library, bypasses lsl-sys cmake build)
+          liblsl
+        ]
+        ++ pkgs.lib.optionals isLinux (with pkgs; [
           # Vulkan / GPU
           vulkan-loader
           vulkan-headers
@@ -48,21 +61,24 @@
           fontconfig
           freetype
 
-          # Audio
+          # Audio (ALSA)
           alsa-lib
-
-          # TLS
-          openssl
-
-          # Compression
-          zstd
-
-          # LSL (system library, bypasses lsl-sys cmake build)
-          liblsl
 
           # D-Bus (required by bluer for BlueZ Bluetooth)
           dbus
-        ];
+        ])
+        ++ pkgs.lib.optionals isDarwin (with pkgs; [
+          darwin.apple_sdk.frameworks.AudioUnit
+          darwin.apple_sdk.frameworks.CoreAudio
+          darwin.apple_sdk.frameworks.CoreFoundation
+          darwin.apple_sdk.frameworks.CoreGraphics
+          darwin.apple_sdk.frameworks.CoreText
+          darwin.apple_sdk.frameworks.AppKit
+          darwin.apple_sdk.frameworks.Metal
+          darwin.apple_sdk.frameworks.IOBluetooth
+          darwin.apple_sdk.frameworks.Security
+          darwin.apple_sdk.frameworks.SystemConfiguration
+        ]);
 
         # Tools needed at build time
         nativeBuildInputs = with pkgs; [
@@ -90,15 +106,17 @@
           inherit cargoArtifacts;
         });
 
-        # Runtime library path for Vulkan/Wayland/etc
-        runtimeLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
-          vulkan-loader
-          wayland
-          libxkbcommon
-          mesa
-          liblsl
-          dbus
-        ]);
+        # Runtime library path (Linux only — macOS uses @rpath)
+        runtimeLibPath = pkgs.lib.optionalString isLinux (
+          pkgs.lib.makeLibraryPath (with pkgs; [
+            vulkan-loader
+            wayland
+            libxkbcommon
+            mesa
+            liblsl
+            dbus
+          ])
+        );
 
       in {
         packages.default = mind-daw;
@@ -111,15 +129,16 @@
           });
         };
 
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell ({
           packages = with pkgs; [
             rustToolchain
             rust-analyzer
           ] ++ buildInputs ++ nativeBuildInputs;
 
-          LD_LIBRARY_PATH = runtimeLibPath;
           ZSTD_SYS_USE_PKG_CONFIG = "1";
-        };
+        } // pkgs.lib.optionalAttrs isLinux {
+          LD_LIBRARY_PATH = runtimeLibPath;
+        });
       }
     );
 }
