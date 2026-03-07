@@ -34,6 +34,7 @@ struct MindDaw {
     // Audio sonification
     audio_handle: Option<AudioHandle>,
     audio_enabled: bool,
+    selected_channel: Option<usize>,
 
     // UI
     active_tab: Tab,
@@ -57,8 +58,9 @@ impl MindDaw {
 
             audio_handle: None,
             audio_enabled: false,
+            selected_channel: None,
 
-            active_tab: Tab::Waves,
+            active_tab: Tab::Spectrum,
         }
     }
 
@@ -169,17 +171,40 @@ impl MindDaw {
             return;
         }
         if let Some(ref handle) = self.audio_handle {
-            let frame = EegFrame {
-                channels: self
-                    .cog_buffer
+            let channels: Vec<Vec<f32>> = if let Some(ch) = self.selected_channel {
+                // Single selected channel
+                if let Some(buf) = self.cog_buffer.get(ch) {
+                    let n = buf.len().min(64);
+                    vec![buf.iter().rev().take(n).rev().copied().collect()]
+                } else {
+                    return;
+                }
+            } else {
+                // All channels
+                self.cog_buffer
                     .iter()
                     .map(|buf| {
                         let n = buf.len().min(64);
                         buf.iter().rev().take(n).rev().copied().collect()
                     })
-                    .collect(),
+                    .collect()
             };
-            let _ = handle.cmd_tx.try_send(AudioCommand::Frame(frame));
+            let _ = handle.cmd_tx.try_send(AudioCommand::Frame(EegFrame { channels }));
+        }
+    }
+
+    fn select_channel(&mut self, ch: usize, cx: &mut Context<Self>) {
+        if self.selected_channel == Some(ch) {
+            // Deselect — stop audio
+            self.selected_channel = None;
+            self.stop_audio(cx);
+        } else {
+            // Select new channel — (re)start audio with 1 channel
+            self.selected_channel = Some(ch);
+            if self.audio_handle.is_some() {
+                self.stop_audio(cx);
+            }
+            self.start_audio(1, cx);
         }
     }
 
@@ -619,7 +644,7 @@ impl MindDaw {
                 };
 
                 let content: Div = if active_tab == Tab::Spectrum {
-                    render_spectrum_grid(cog_waveform_data)
+                    self.render_spectrum_grid(cog_waveform_data, cx)
                 } else {
                     div().flex().flex_col().gap_1().children(
                         cog_waveform_data
@@ -931,7 +956,7 @@ fn compute_spectrum(data: &[f32], fft_size: usize) -> Vec<f32> {
 
 /// Render an FFT spectrum plot for one channel using gpui canvas.
 fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
-    let spectrum = compute_spectrum(data, 128);
+    let spectrum = compute_spectrum(data, 32);
 
     canvas(
         move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
@@ -1004,37 +1029,60 @@ fn spectrum_canvas(data: &[f32], ch: usize) -> impl IntoElement {
     .h(px(48.0))
 }
 
-/// Render the 8x8 spectrum grid for all 64 channels.
-fn render_spectrum_grid(waveform_data: &[Vec<f32>]) -> Div {
-    let cols = 8;
-    let rows = 8;
+impl MindDaw {
+    /// Render the 8x8 spectrum grid for all 64 channels.
+    fn render_spectrum_grid(
+        &mut self,
+        waveform_data: &[Vec<f32>],
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let cols = 8;
+        let rows = 8;
+        let selected = self.selected_channel;
 
-    let mut grid = div().flex().flex_col().gap(px(2.0));
+        let mut grid = div().flex().flex_col().gap(px(2.0));
 
-    for row in 0..rows {
-        let mut row_div = div().flex().gap(px(2.0));
-        for col in 0..cols {
-            let ch = row * cols + col;
-            let data = waveform_data.get(ch).cloned().unwrap_or_default();
+        for row in 0..rows {
+            let mut row_div = div().flex().gap(px(2.0));
+            for col in 0..cols {
+                let ch = row * cols + col;
+                let data = waveform_data.get(ch).cloned().unwrap_or_default();
+                let is_selected = selected == Some(ch);
 
-            row_div = row_div.child(
-                div()
+                let mut cell = div()
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _window, cx| {
+                        this.select_channel(ch, cx);
+                    }))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(gpui::hsla(0.0, 0.0, 0.5, 1.0))
+                            .text_color(if is_selected {
+                                gpui::hsla(0.33, 0.9, 0.6, 1.0)
+                            } else {
+                                gpui::hsla(0.0, 0.0, 0.5, 1.0)
+                            })
                             .child(format!("Ch{ch}")),
                     )
-                    .child(spectrum_canvas(&data, ch)),
-            );
-        }
-        grid = grid.child(row_div);
-    }
+                    .child(spectrum_canvas(&data, ch));
 
-    grid
+                if is_selected {
+                    cell = cell
+                        .rounded(px(3.0))
+                        .border_1()
+                        .border_color(gpui::hsla(0.33, 0.9, 0.55, 0.8));
+                }
+
+                row_div = row_div.child(cell);
+            }
+            grid = grid.child(row_div);
+        }
+
+        grid
+    }
 }
 
 fn main() {

@@ -23,9 +23,18 @@ pub struct AudioHandle {
 
 // ── Sonification pipeline ────────────────────────────────────────────────────
 
+const BINS_PER_CHANNEL: usize = 8;
+const AUDIO_FFT_SIZE: usize = 4096;
+/// 3-octave range: C3 to C6
+const BASE_FREQ: f32 = 130.81;
+const NUM_OCTAVES: f32 = 3.0;
+
 struct SonificationPipeline {
     fft_size: usize,
+    bins_per_channel: usize,
     concat_len: usize,
+    audio_fft_size: usize,
+    sample_rate: f32,
     hann_window: Vec<f32>,
     overlap_buf: Vec<f32>,
     peak_level: f32,
@@ -37,7 +46,7 @@ struct SonificationPipeline {
 
 impl SonificationPipeline {
     fn new(num_channels: usize, fft_size: usize, audio_sample_rate: u32, poll_rate_hz: f32) -> Self {
-        let concat_len = num_channels * fft_size;
+        let concat_len = num_channels * BINS_PER_CHANNEL;
         let output_len = (audio_sample_rate as f32 / poll_rate_hz) as usize;
 
         // Pre-compute Hann window
@@ -49,19 +58,21 @@ impl SonificationPipeline {
             .collect();
 
         let mut planner = FftPlanner::new();
-        // Pre-plan both FFTs so internal caches are warm
         let _ = planner.plan_fft_forward(fft_size);
-        let _ = planner.plan_fft_inverse(concat_len);
+        let _ = planner.plan_fft_inverse(AUDIO_FFT_SIZE);
 
         let fwd_scratch_len = planner.plan_fft_forward(fft_size).get_inplace_scratch_len();
-        let inv_scratch_len = planner.plan_fft_inverse(concat_len).get_inplace_scratch_len();
+        let inv_scratch_len = planner.plan_fft_inverse(AUDIO_FFT_SIZE).get_inplace_scratch_len();
         let scratch_len = fwd_scratch_len.max(inv_scratch_len);
 
         Self {
             fft_size,
+            bins_per_channel: BINS_PER_CHANNEL,
             concat_len,
+            audio_fft_size: AUDIO_FFT_SIZE,
+            sample_rate: audio_sample_rate as f32,
             hann_window,
-            overlap_buf: vec![0.0; 64], // crossfade length
+            overlap_buf: vec![0.0; 64],
             peak_level: 1.0,
             output_len,
             fwd_scratch: vec![Complex::default(); scratch_len],
@@ -72,34 +83,70 @@ impl SonificationPipeline {
 
     fn process(&mut self, frame: &EegFrame) -> Vec<f32> {
         let fwd = self.fft_planner.plan_fft_forward(self.fft_size);
-        let inv = self.fft_planner.plan_fft_inverse(self.concat_len);
+        let inv = self.fft_planner.plan_fft_inverse(self.audio_fft_size);
 
-        // 1. FFT each channel and concatenate
+        // 1. FFT each channel, bucket into 8 bins, and concatenate
         let mut concat_spectrum = Vec::with_capacity(self.concat_len);
+        let bucket_size = self.fft_size / self.bins_per_channel;
 
         for ch_data in &frame.channels {
             let n = ch_data.len().min(self.fft_size);
             let mut buf: Vec<Complex<f32>> = vec![Complex::default(); self.fft_size];
 
-            // Copy samples with Hann window, zero-pad if short
             for i in 0..n {
                 let idx = ch_data.len().saturating_sub(self.fft_size) + i;
                 buf[i] = Complex::new(ch_data.get(idx).copied().unwrap_or(0.0) * self.hann_window[i], 0.0);
             }
 
             fwd.process_with_scratch(&mut buf, &mut self.fwd_scratch);
-            concat_spectrum.extend_from_slice(&buf);
+
+            for b in 0..self.bins_per_channel {
+                let start = b * bucket_size;
+                let end = start + bucket_size;
+                let mut sum = Complex::default();
+                for k in start..end {
+                    sum += buf[k];
+                }
+                concat_spectrum.push(sum / bucket_size as f32);
+            }
         }
 
-        // Pad if fewer channels than expected
         concat_spectrum.resize(self.concat_len, Complex::default());
 
-        // 2. Inverse FFT the concatenated spectrum
-        inv.process_with_scratch(&mut concat_spectrum, &mut self.inv_scratch);
+        // Spectral gating: subtract the median magnitude to remove white noise floor
+        let mut mags: Vec<f32> = concat_spectrum.iter().map(|c| c.norm()).collect();
+        mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_mag = mags[mags.len() / 2];
+        for bin in &mut concat_spectrum {
+            let mag = bin.norm();
+            if mag <= median_mag {
+                *bin = Complex::default();
+            } else {
+                *bin *= (mag - median_mag) / mag;
+            }
+        }
 
-        // 3. Take real parts, normalize by 1/concat_len
-        let inv_norm = 1.0 / self.concat_len as f32;
-        let time_domain: Vec<f32> = concat_spectrum.iter().map(|c| c.re * inv_norm).collect();
+        // 2. Map EEG bins into a 3-octave audio range (C3–C6) via logarithmic spacing
+        let n_eeg = concat_spectrum.len();
+        let mut audio_spec = vec![Complex::<f32>::default(); self.audio_fft_size];
+
+        for (i, &val) in concat_spectrum.iter().enumerate() {
+            // Logarithmic frequency mapping: each bin spans equal fraction of the octave range
+            let freq = BASE_FREQ * 2.0f32.powf(i as f32 / n_eeg as f32 * NUM_OCTAVES);
+            let audio_bin = (freq * self.audio_fft_size as f32 / self.sample_rate).round() as usize;
+
+            if audio_bin > 0 && audio_bin < self.audio_fft_size / 2 {
+                audio_spec[audio_bin] += val;
+                // Conjugate symmetry for real-valued output
+                audio_spec[self.audio_fft_size - audio_bin] += val.conj();
+            }
+        }
+
+        // 3. Inverse FFT the audio-rate spectrum
+        inv.process_with_scratch(&mut audio_spec, &mut self.inv_scratch);
+
+        let inv_norm = 1.0 / self.audio_fft_size as f32;
+        let time_domain: Vec<f32> = audio_spec.iter().map(|c| c.re * inv_norm).collect();
 
         // 4. Resample to output_len
         let mut resampled = resample_linear(&time_domain, self.output_len);
