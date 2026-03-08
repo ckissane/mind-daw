@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Soundboard / Sampler</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0d0d0f;
+    color: #e0e0e0;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px;
+    gap: 20px;
+  }
+
+  h1 {
+    font-size: 1.1rem;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: #888;
+  }
+
+  /* ── Panels ─────────────────────────────────── */
+  .row { display: flex; gap: 16px; width: 100%; max-width: 860px; flex-wrap: wrap; }
+
+  .panel {
+    background: #141418;
+    border: 1px solid #222;
+    border-radius: 10px;
+    padding: 16px 20px;
+    flex: 1;
+    min-width: 180px;
+  }
+
+  .panel-title {
+    font-size: 0.65rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: #555;
+    margin-bottom: 12px;
+  }
+
+  /* ── Radio groups ────────────────────────────── */
+  .radio-group { display: flex; flex-direction: column; gap: 6px; }
+
+  .radio-btn {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    padding: 7px 12px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    transition: all 0.15s;
+    font-size: 0.82rem;
+  }
+
+  .radio-btn:hover { background: #1e1e24; border-color: #333; }
+
+  .radio-btn.active {
+    background: #1a1a2e;
+    border-color: #4a4aff;
+    color: #8080ff;
+  }
+
+  .radio-btn.active .dot { background: #6060ff; box-shadow: 0 0 6px #6060ff; }
+
+  .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #333;
+    flex-shrink: 0;
+    transition: all 0.15s;
+  }
+
+  /* instrument panel accent colours */
+  .inst-panel .radio-btn.active { background: #1a2a1a; border-color: #44cc66; color: #66dd88; }
+  .inst-panel .radio-btn.active .dot { background: #44cc66; box-shadow: 0 0 6px #44cc66; }
+
+  /* ── Controls row ────────────────────────────── */
+  .ctrl-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    width: 100%;
+    max-width: 860px;
+    flex-wrap: wrap;
+  }
+
+  .ctrl-panel {
+    background: #141418;
+    border: 1px solid #222;
+    border-radius: 10px;
+    padding: 12px 18px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .ctrl-label { font-size: 0.65rem; letter-spacing: 0.15em; text-transform: uppercase; color: #555; }
+
+  input[type=range] {
+    -webkit-appearance: none;
+    width: 90px;
+    height: 4px;
+    background: #2a2a35;
+    border-radius: 2px;
+    outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #6060ff;
+    cursor: pointer;
+  }
+
+  .icon-btn {
+    background: #1e1e28;
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #aaa;
+    font-size: 0.75rem;
+    padding: 5px 10px;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.05em;
+  }
+  .icon-btn:hover { background: #28283a; border-color: #555; color: #ddd; }
+  .icon-btn.active { background: #1e1e3a; border-color: #6060ff; color: #8080ff; }
+
+  .octave-display {
+    font-size: 0.85rem;
+    color: #8080ff;
+    min-width: 24px;
+    text-align: center;
+  }
+
+  /* chord buttons */
+  .chord-group { display: flex; gap: 6px; }
+  .chord-btn {
+    background: #1e2a1e;
+    border: 1px solid #2a4a2a;
+    border-radius: 6px;
+    color: #558855;
+    font-size: 0.72rem;
+    padding: 5px 10px;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  .chord-btn:hover { background: #253025; border-color: #44aa44; color: #88cc88; }
+  .chord-btn.active { background: #1a2e1a; border-color: #44cc66; color: #66dd88; box-shadow: 0 0 6px #44cc6640; }
+
+  /* ── Piano keyboard ──────────────────────────── */
+  .keyboard-wrap {
+    width: 100%;
+    max-width: 860px;
+    background: #141418;
+    border: 1px solid #222;
+    border-radius: 10px;
+    padding: 16px 16px 12px;
+  }
+
+  .keyboard-title {
+    font-size: 0.65rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: #555;
+    margin-bottom: 14px;
+  }
+
+  .keyboard {
+    position: relative;
+    display: flex;
+    height: 120px;
+    gap: 3px;
+    user-select: none;
+  }
+
+  .key-white {
+    flex: 1;
+    background: linear-gradient(180deg, #222226 0%, #1c1c20 100%);
+    border: 1px solid #333;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    padding-bottom: 8px;
+    gap: 3px;
+    transition: background 0.06s;
+    min-width: 36px;
+    position: relative;
+  }
+
+  .key-white:hover { background: linear-gradient(180deg, #2a2a32 0%, #242428 100%); }
+
+  .key-white.pressed {
+    background: linear-gradient(180deg, #2a2aaa 0%, #2020aa 100%);
+    border-color: #6060ff;
+    box-shadow: 0 0 8px #4040cc80;
+  }
+
+  .key-white.pressed-green {
+    background: linear-gradient(180deg, #1a6a2a 0%, #144420 100%);
+    border-color: #44cc66;
+    box-shadow: 0 0 8px #44cc6680;
+  }
+
+  .key-note { font-size: 0.6rem; color: #555; letter-spacing: 0.05em; }
+  .key-hotkey { font-size: 0.55rem; color: #3a3a4a; }
+
+  .key-white.pressed .key-note,
+  .key-white.pressed .key-hotkey { color: #aaaaff; }
+
+  .key-black-wrap {
+    position: absolute;
+    top: 0;
+    height: 72px;
+    pointer-events: none;
+    display: flex;
+    left: 0; right: 0;
+  }
+
+  /* black key positioning handled via JS/inline */
+  .key-black {
+    position: absolute;
+    width: 26px;
+    height: 72px;
+    background: linear-gradient(180deg, #111113 0%, #0d0d0f 60%, #161618 100%);
+    border: 1px solid #2a2a2a;
+    border-radius: 3px;
+    cursor: pointer;
+    pointer-events: all;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    padding-bottom: 6px;
+    gap: 2px;
+    transition: background 0.06s;
+  }
+
+  .key-black:hover { background: linear-gradient(180deg, #1a1a20 0%, #141418 60%, #1e1e22 100%); }
+
+  .key-black.pressed {
+    background: linear-gradient(180deg, #202090 0%, #181880 100%);
+    border-color: #5050ff;
+    box-shadow: 0 0 6px #4040cc80;
+  }
+
+  .key-black.pressed-green {
+    background: linear-gradient(180deg, #135022 0%, #0e3a18 100%);
+    border-color: #33aa55;
+  }
+
+  .key-black .key-note { font-size: 0.5rem; color: #444; }
+  .key-black .key-hotkey { font-size: 0.45rem; color: #2a2a3a; }
+  .key-black.pressed .key-note,
+  .key-black.pressed .key-hotkey { color: #8888ff; }
+
+  /* ── Visualiser ───────────────────────────────── */
+  canvas {
+    width: 100%;
+    max-width: 860px;
+    height: 60px;
+    border-radius: 8px;
+    background: #0d0d10;
+    border: 1px solid #1e1e24;
+  }
+
+  /* ── Status bar ───────────────────────────────── */
+  .status {
+    font-size: 0.65rem;
+    color: #444;
+    letter-spacing: 0.1em;
+  }
+  .status span { color: #6060ff; }
+</style>
+</head>
+<body>
+
+<h1>Soundboard · Sampler</h1>
+
+<!-- Top row: waveform + instrument -->
+<div class="row">
+  <div class="panel" id="wave-panel">
+    <div class="panel-title">Waveform</div>
+    <div class="radio-group" id="waveform-group">
+      <label class="radio-btn active" data-val="sine">    <span class="dot"></span>Sine</label>
+      <label class="radio-btn"        data-val="sawtooth"><span class="dot"></span>Saw</label>
+      <label class="radio-btn"        data-val="triangle"><span class="dot"></span>Triangle</label>
+      <label class="radio-btn"        data-val="square">  <span class="dot"></span>Square</label>
+    </div>
+  </div>
+
+  <div class="panel inst-panel" id="inst-panel">
+    <div class="panel-title">Instrument</div>
+    <div class="radio-group" id="inst-group">
+      <label class="radio-btn" data-val="kick">  <span class="dot"></span>Kick</label>
+      <label class="radio-btn" data-val="snare"> <span class="dot"></span>Snare</label>
+      <label class="radio-btn active" data-val="piano"><span class="dot"></span>Piano</label>
+      <label class="radio-btn" data-val="strings"><span class="dot"></span>Strings</label>
+    </div>
+  </div>
+</div>
+
+<!-- Controls row -->
+<div class="ctrl-row">
+  <div class="ctrl-panel">
+    <span class="ctrl-label">Vol</span>
+    <input type="range" id="vol" min="0" max="1" step="0.01" value="0.7">
+  </div>
+
+  <div class="ctrl-panel">
+    <span class="ctrl-label">Octave</span>
+    <button class="icon-btn" id="oct-down">−</button>
+    <span class="octave-display" id="oct-display">4</span>
+    <button class="icon-btn" id="oct-up">+</button>
+  </div>
+
+  <div class="ctrl-panel">
+    <span class="ctrl-label">Chord</span>
+    <div class="chord-group">
+      <button class="chord-btn" data-chord="major">Maj</button>
+      <button class="chord-btn" data-chord="minor">Min</button>
+      <button class="chord-btn" data-chord="dom7">7th</button>
+      <button class="chord-btn" data-chord="sus4">Sus4</button>
+    </div>
+  </div>
+
+  <div class="ctrl-panel">
+    <span class="ctrl-label">Reverb</span>
+    <input type="range" id="reverb-mix" min="0" max="1" step="0.01" value="0.15">
+  </div>
+</div>
+
+<!-- Piano keyboard -->
+<div class="keyboard-wrap">
+  <div class="keyboard-title">Keyboard &nbsp;·&nbsp; <span style="color:#3a3a4a">a s d f g h j k l ; '  /  w e  t y u  o p</span></div>
+  <div class="keyboard" id="keyboard"></div>
+</div>
+
+<!-- Waveform visualiser -->
+<canvas id="vis" height="60"></canvas>
+
+<div class="status">instrument: <span id="st-inst">piano</span> &nbsp;·&nbsp; waveform: <span id="st-wave">sine</span> &nbsp;·&nbsp; chord: <span id="st-chord">off</span></div>
+
+<script>
+// ─────────────────────────────────────────────────────────────
+// Audio context + helpers
+// ─────────────────────────────────────────────────────────────
+let ctx = null;
+
+function getCtx() {
+  if (!ctx) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    initReverb();
+    startVis();
+  }
+  if (ctx.state === 'suspended') ctx.resume();
+  return ctx;
+}
+
+// Master gain
+let masterGain;
+let reverbNode, dryGain, wetGain;
+
+function initReverb() {
+  masterGain = ctx.createGain();
+  masterGain.gain.value = 0.7;
+
+  dryGain = ctx.createGain();
+  dryGain.gain.value = 0.85;
+
+  wetGain = ctx.createGain();
+  wetGain.gain.value = 0.15;
+
+  reverbNode = createReverb(ctx);
+
+  masterGain.connect(dryGain);
+  masterGain.connect(reverbNode);
+  reverbNode.connect(wetGain);
+
+  dryGain.connect(ctx.destination);
+  wetGain.connect(ctx.destination);
+}
+
+function createReverb(ctx) {
+  const conv = ctx.createConvolver();
+  const len = ctx.sampleRate * 2.5;
+  const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
+    }
+  }
+  conv.buffer = buf;
+  return conv;
+}
+
+function getDest() { return masterGain; }
+
+// ─────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────
+let selectedWaveform = 'sine';
+let selectedInstrument = 'piano';
+let chordMode = null;
+let octave = 4;
+
+// ─────────────────────────────────────────────────────────────
+// Note definitions
+// ─────────────────────────────────────────────────────────────
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+function noteFreq(note, oct) {
+  // A4 = 440 Hz, MIDI A4 = 69
+  const semitone = NOTE_NAMES.indexOf(note) + (oct + 1) * 12;
+  return 440 * Math.pow(2, (semitone - 69) / 12);
+}
+
+// Keyboard layout: two octaves C..B C..B + extra C
+const WHITE_NOTES = ['C','D','E','F','G','A','B'];
+const BLACK_MAP   = { 'C':'C#', 'D':'D#', 'F':'F#', 'G':'G#', 'A':'A#' }; // white→sharp
+
+// Two octaves of white keys
+const whiteKeys = [];
+for (let o = 0; o < 2; o++) {
+  WHITE_NOTES.forEach(n => whiteKeys.push({ note: n, octOffset: o }));
+}
+whiteKeys.push({ note: 'C', octOffset: 2 }); // top C
+
+// Keyboard mappings (in order of whiteKeys)
+const WHITE_HOTKEYS = 'a s d f g h j k l ; \''.split(' ').concat(['/']);
+const BLACK_HOTKEYS_MAP = {
+  'C#,0':'w','D#,0':'e','F#,0':'t','G#,0':'y','A#,0':'u',
+  'C#,1':'o','D#,1':'p'
+};
+
+// Chord intervals (semitones from root)
+const CHORD_INTERVALS = {
+  major: [0, 4, 7],
+  minor: [0, 3, 7],
+  dom7:  [0, 4, 7, 10],
+  sus4:  [0, 5, 7],
+};
+
+function semitoneOffset(note, oct, semis) {
+  const allNotes = [];
+  for (let o = 0; o <= 8; o++) NOTE_NAMES.forEach(n => allNotes.push({ note: n, oct: o }));
+  const rootIdx = NOTE_NAMES.indexOf(note) + (oct + 1) * 12 - 12;
+  const targetIdx = rootIdx + semis;
+  return { note: NOTE_NAMES[targetIdx % 12], oct: Math.floor(targetIdx / 12) - 1 };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Synthesis
+// ─────────────────────────────────────────────────────────────
+function scheduleGain(g, attack, decay, sustain, release, total) {
+  const t = ctx.currentTime;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(1, t + attack);
+  g.gain.exponentialRampToValueAtTime(sustain, t + attack + decay);
+  g.gain.setValueAtTime(sustain, t + total - release);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + total);
+}
+
+function playKick(freq) {
+  const ac = getCtx();
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  const dur = 0.55;
+
+  osc.type = selectedWaveform;
+  const startFreq = Math.max(freq * 2, 120);
+  osc.frequency.setValueAtTime(startFreq, ac.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(freq * 0.4, 30), ac.currentTime + 0.35);
+
+  gain.gain.setValueAtTime(1.2, ac.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+
+  osc.connect(gain);
+  gain.connect(getDest());
+  osc.start(ac.currentTime);
+  osc.stop(ac.currentTime + dur);
+}
+
+function playSnare(freq) {
+  const ac = getCtx();
+  const dur = 0.25;
+
+  // Noise burst
+  const bufSz = Math.ceil(ac.sampleRate * dur);
+  const buf = ac.createBuffer(1, bufSz, ac.sampleRate);
+  const dat = buf.getChannelData(0);
+  for (let i = 0; i < bufSz; i++) dat[i] = Math.random() * 2 - 1;
+
+  const noiseSrc = ac.createBufferSource();
+  noiseSrc.buffer = buf;
+
+  const bandpass = ac.createBiquadFilter();
+  bandpass.type = 'bandpass';
+  bandpass.frequency.value = freq * 2;
+  bandpass.Q.value = 0.8;
+
+  const noiseEnv = ac.createGain();
+  noiseEnv.gain.setValueAtTime(1, ac.currentTime);
+  noiseEnv.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+
+  noiseSrc.connect(bandpass);
+  bandpass.connect(noiseEnv);
+  noiseEnv.connect(getDest());
+  noiseSrc.start(ac.currentTime);
+  noiseSrc.stop(ac.currentTime + dur);
+
+  // Tone body
+  const osc = ac.createOscillator();
+  osc.type = selectedWaveform;
+  osc.frequency.value = freq;
+  const oscEnv = ac.createGain();
+  oscEnv.gain.setValueAtTime(0.6, ac.currentTime);
+  oscEnv.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.12);
+  osc.connect(oscEnv);
+  oscEnv.connect(getDest());
+  osc.start(ac.currentTime);
+  osc.stop(ac.currentTime + 0.12);
+}
+
+function playPiano(freq) {
+  const ac = getCtx();
+  const dur = 1.6;
+
+  const osc = ac.createOscillator();
+  osc.type = selectedWaveform;
+  osc.frequency.value = freq;
+
+  // 2nd harmonic adds piano brightness
+  const osc2 = ac.createOscillator();
+  osc2.type = selectedWaveform;
+  osc2.frequency.value = freq * 2;
+  const osc2g = ac.createGain();
+  osc2g.gain.value = 0.18;
+
+  const gain = ac.createGain();
+  scheduleGain(gain, 0.008, 0.25, 0.5, 0.6, dur);
+
+  osc.connect(gain);
+  osc2.connect(osc2g);
+  osc2g.connect(gain);
+  gain.connect(getDest());
+
+  osc.start(ac.currentTime);
+  osc2.start(ac.currentTime);
+  osc.stop(ac.currentTime + dur);
+  osc2.stop(ac.currentTime + dur);
+}
+
+function playStrings(freq) {
+  const ac = getCtx();
+  const dur = 3.2;
+  const detunes = [-8, 0, 8];
+  const group = ac.createGain();
+
+  detunes.forEach(dt => {
+    const osc = ac.createOscillator();
+    // strings always prefer sawtooth if sine is chosen
+    osc.type = selectedWaveform === 'sine' ? 'sawtooth' : selectedWaveform;
+    osc.frequency.value = freq;
+    osc.detune.value = dt;
+    const g = ac.createGain();
+    g.gain.value = 1 / detunes.length;
+    osc.connect(g);
+    g.connect(group);
+    osc.start(ac.currentTime);
+    osc.stop(ac.currentTime + dur);
+  });
+
+  // Gentle lowpass for warmth
+  const lp = ac.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 3500;
+
+  const env = ac.createGain();
+  env.gain.setValueAtTime(0, ac.currentTime);
+  env.gain.linearRampToValueAtTime(0.7, ac.currentTime + 0.5);   // slow attack
+  env.gain.setValueAtTime(0.7, ac.currentTime + dur - 0.9);
+  env.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+
+  group.connect(lp);
+  lp.connect(env);
+  env.connect(getDest());
+}
+
+function triggerNote(note, oct) {
+  const freq = noteFreq(note, oct);
+
+  if (chordMode && CHORD_INTERVALS[chordMode]) {
+    CHORD_INTERVALS[chordMode].forEach(semi => {
+      const { note: n, oct: o } = semitoneOffset(note, oct, semi);
+      playOneNote(noteFreq(n, o));
+    });
+  } else {
+    playOneNote(freq);
+  }
+}
+
+function playOneNote(freq) {
+  switch (selectedInstrument) {
+    case 'kick':    playKick(freq);    break;
+    case 'snare':   playSnare(freq);   break;
+    case 'piano':   playPiano(freq);   break;
+    case 'strings': playStrings(freq); break;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Build keyboard DOM
+// ─────────────────────────────────────────────────────────────
+const kbEl = document.getElementById('keyboard');
+
+// Build white keys
+whiteKeys.forEach((k, i) => {
+  const div = document.createElement('div');
+  div.className = 'key-white';
+  div.dataset.note = k.note;
+  div.dataset.octOffset = k.octOffset;
+  div.dataset.idx = i;
+
+  const hk = WHITE_HOTKEYS[i] || '';
+  div.innerHTML = `<span class="key-note">${k.note}${k.octOffset}</span><span class="key-hotkey">${hk}</span>`;
+
+  div.addEventListener('mousedown', () => {
+    getCtx();
+    flashKey(div, false);
+    triggerNote(k.note, octave + k.octOffset);
+  });
+
+  kbEl.appendChild(div);
+});
+
+// Build black keys — positioned absolutely between whites
+function buildBlackKeys() {
+  const whites = Array.from(kbEl.querySelectorAll('.key-white'));
+  const kbRect = kbEl.getBoundingClientRect();
+
+  whites.forEach((wEl, i) => {
+    const note = wEl.dataset.note;
+    const octOffset = parseInt(wEl.dataset.octOffset);
+    if (!BLACK_MAP[note]) return;
+
+    const sharpNote = BLACK_MAP[note];
+    const wRect = wEl.getBoundingClientRect();
+    const leftPct = ((wRect.left - kbRect.left) + wRect.width * 0.6) / kbRect.width * 100;
+
+    const div = document.createElement('div');
+    div.className = 'key-black';
+    div.dataset.note = sharpNote;
+    div.dataset.octOffset = octOffset;
+
+    const hk = BLACK_HOTKEYS_MAP[`${sharpNote},${octOffset}`] || '';
+    div.style.left = `calc(${leftPct}% - 13px)`;
+    div.innerHTML = `<span class="key-note">${sharpNote.replace('#','♯')}</span><span class="key-hotkey">${hk}</span>`;
+
+    div.addEventListener('mousedown', e => {
+      e.stopPropagation();
+      getCtx();
+      flashKey(div, false);
+      triggerNote(sharpNote, octave + octOffset);
+    });
+
+    kbEl.appendChild(div);
+  });
+}
+
+// Wait a tick for layout
+requestAnimationFrame(() => { buildBlackKeys(); });
+
+window.addEventListener('resize', () => {
+  // rebuild black key positions
+  kbEl.querySelectorAll('.key-black').forEach(el => el.remove());
+  buildBlackKeys();
+});
+
+function flashKey(el, isGreen) {
+  const cls = isGreen ? 'pressed-green' : 'pressed';
+  el.classList.add(cls);
+  setTimeout(() => el.classList.remove(cls), 200);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Keyboard input
+// ─────────────────────────────────────────────────────────────
+const keyMap = {};
+WHITE_HOTKEYS.forEach((k, i) => {
+  if (k && whiteKeys[i]) {
+    keyMap[k] = { note: whiteKeys[i].note, octOffset: whiteKeys[i].octOffset };
+  }
+});
+Object.entries(BLACK_HOTKEYS_MAP).forEach(([noteOct, k]) => {
+  const [note, octOffset] = noteOct.split(',');
+  keyMap[k] = { note, octOffset: parseInt(octOffset) };
+});
+
+const held = new Set();
+
+document.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (held.has(k)) return;
+  held.add(k);
+
+  if (keyMap[k]) {
+    getCtx();
+    const { note, octOffset } = keyMap[k];
+    triggerNote(note, octave + octOffset);
+
+    // visual
+    const el = kbEl.querySelector(`[data-note="${note}"][data-oct-offset="${octOffset}"]`);
+    if (el) flashKey(el, false);
+  }
+});
+
+document.addEventListener('keyup', e => {
+  held.delete(e.key.toLowerCase());
+});
+
+// ─────────────────────────────────────────────────────────────
+// UI controls
+// ─────────────────────────────────────────────────────────────
+
+// Radio groups
+function setupRadio(groupId, onChange) {
+  const group = document.getElementById(groupId);
+  group.querySelectorAll('.radio-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      group.querySelectorAll('.radio-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      onChange(btn.dataset.val);
+    });
+  });
+}
+
+setupRadio('waveform-group', val => {
+  selectedWaveform = val;
+  document.getElementById('st-wave').textContent = val;
+});
+
+setupRadio('inst-group', val => {
+  selectedInstrument = val;
+  document.getElementById('st-inst').textContent = val;
+});
+
+// Volume
+document.getElementById('vol').addEventListener('input', e => {
+  if (masterGain) masterGain.gain.value = parseFloat(e.target.value);
+});
+
+// Reverb mix
+document.getElementById('reverb-mix').addEventListener('input', e => {
+  const v = parseFloat(e.target.value);
+  if (dryGain)  dryGain.gain.value = 1 - v * 0.6;
+  if (wetGain)  wetGain.gain.value = v;
+});
+
+// Octave
+document.getElementById('oct-down').addEventListener('click', () => {
+  octave = Math.max(1, octave - 1);
+  document.getElementById('oct-display').textContent = octave;
+});
+document.getElementById('oct-up').addEventListener('click', () => {
+  octave = Math.min(6, octave + 1);
+  document.getElementById('oct-display').textContent = octave;
+});
+
+// Chord buttons
+document.querySelectorAll('.chord-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const chord = btn.dataset.chord;
+    if (chordMode === chord) {
+      chordMode = null;
+      btn.classList.remove('active');
+      document.getElementById('st-chord').textContent = 'off';
+    } else {
+      document.querySelectorAll('.chord-btn').forEach(b => b.classList.remove('active'));
+      chordMode = chord;
+      btn.classList.add('active');
+      document.getElementById('st-chord').textContent = chord;
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Analyser / visualiser
+// ─────────────────────────────────────────────────────────────
+let analyser, visData;
+
+function startVis() {
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  visData = new Float32Array(analyser.fftSize);
+
+  // tap into master
+  masterGain.connect(analyser);
+
+  const canvas = document.getElementById('vis');
+  const canvasCtx = canvas.getContext('2d');
+
+  function draw() {
+    requestAnimationFrame(draw);
+    analyser.getFloatTimeDomainData(visData);
+
+    const W = canvas.offsetWidth, H = canvas.offsetHeight;
+    canvas.width = W; canvas.height = H;
+
+    canvasCtx.clearRect(0, 0, W, H);
+    canvasCtx.fillStyle = '#0d0d10';
+    canvasCtx.fillRect(0, 0, W, H);
+
+    canvasCtx.strokeStyle = '#4040cc';
+    canvasCtx.lineWidth = 1.5;
+    canvasCtx.shadowColor = '#6060ff';
+    canvasCtx.shadowBlur = 4;
+    canvasCtx.beginPath();
+
+    const step = W / visData.length;
+    for (let i = 0; i < visData.length; i++) {
+      const x = i * step;
+      const y = (1 - (visData[i] + 1) / 2) * H;
+      i === 0 ? canvasCtx.moveTo(x, y) : canvasCtx.lineTo(x, y);
+    }
+    canvasCtx.stroke();
+  }
+  draw();
+}
+</script>
+</body>
+</html>

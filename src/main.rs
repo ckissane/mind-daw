@@ -1,5 +1,6 @@
 mod audio;
 mod cognionics;
+mod soundboard;
 mod streams;
 mod word_read;
 
@@ -19,6 +20,37 @@ enum Tab {
     Spectrum,
     Pca,
     Words,
+    Soundboard,
+}
+
+struct SoundboardUiState {
+    waveform: soundboard::SbWaveform,
+    instrument: soundboard::SbInstrument,
+    root_midi: u8,
+    chord: soundboard::SbChord,
+    bpm: u32,
+    n_triggers: u32,
+    volume: f32,
+    is_playing: bool,
+    current_step: u32,
+    trigger_count: u64,
+}
+
+impl Default for SoundboardUiState {
+    fn default() -> Self {
+        Self {
+            waveform: soundboard::SbWaveform::Sine,
+            instrument: soundboard::SbInstrument::Piano,
+            root_midi: 69, // A4
+            chord: soundboard::SbChord::Single,
+            bpm: 120,
+            n_triggers: 4,
+            volume: 0.7,
+            is_playing: false,
+            current_step: 0,
+            trigger_count: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -113,6 +145,10 @@ struct MindDaw {
     // UI
     active_tab: Tab,
     spectrum_band: BrainWaveBand,
+
+    // Soundboard
+    soundboard_handle: Option<soundboard::SoundboardHandle>,
+    sb: SoundboardUiState,
 }
 
 const COG_BUFFER_CAPACITY: usize = 150;
@@ -331,6 +367,9 @@ impl MindDaw {
 
             active_tab: Tab::Spectrum,
             spectrum_band: BrainWaveBand::All,
+
+            soundboard_handle: None,
+            sb: SoundboardUiState::default(),
         }
     }
 
@@ -954,8 +993,20 @@ impl MindDaw {
                             cx.notify();
                         }))
                 };
+                let soundboard_btn = if active_tab == Tab::Soundboard {
+                    Button::new("tab-soundboard").label("Soundboard").primary()
+                } else {
+                    Button::new("tab-soundboard")
+                        .label("Soundboard")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.active_tab = Tab::Soundboard;
+                            cx.notify();
+                        }))
+                };
 
-                let content: Div = if active_tab == Tab::Words {
+                let content: Div = if active_tab == Tab::Soundboard {
+                    self.render_soundboard_view(cx)
+                } else if active_tab == Tab::Words {
                     self.render_word_read_view(cx)
                 } else if active_tab == Tab::Pca {
                     self.render_pca_view(cx)
@@ -1025,6 +1076,7 @@ impl MindDaw {
                                 .child(spectrum_btn)
                                 .child(pca_btn)
                                 .child(words_btn)
+                                .child(soundboard_btn)
                                 .child(audio_btn)
                                 .child(
                                     Button::new("cog-disconnect")
@@ -1846,6 +1898,441 @@ impl MindDaw {
             .gap_4()
             .child(training_area)
             .child(prediction_bar)
+    }
+
+    // ── Soundboard ────────────────────────────────────────────────────────────
+
+    fn sb_ensure_engine(&mut self) {
+        if self.soundboard_handle.is_none() {
+            match soundboard::spawn_soundboard_engine() {
+                Ok(h) => self.soundboard_handle = Some(h),
+                Err(e) => eprintln!("soundboard engine error: {e}"),
+            }
+        }
+    }
+
+    fn sb_play_note(&mut self) {
+        self.sb_ensure_engine();
+        if let Some(ref h) = self.soundboard_handle {
+            let _ = h.cmd_tx.try_send(soundboard::SbCommand::PlayNote {
+                midi: self.sb.root_midi,
+                waveform: self.sb.waveform,
+                instrument: self.sb.instrument,
+                chord: self.sb.chord,
+                volume: self.sb.volume,
+            });
+        }
+    }
+
+    fn sb_start(&mut self, cx: &mut Context<Self>) {
+        self.sb_ensure_engine();
+        self.sb.is_playing = true;
+        self.sb.current_step = 0;
+
+        // Fire first beat immediately
+        self.sb_play_note();
+        self.sb.trigger_count += 1;
+        self.sb.current_step = 1 % self.sb.n_triggers;
+        cx.notify();
+
+        cx.spawn(async |this, cx| {
+            loop {
+                let (interval_ms, still_playing) = this
+                    .update(cx, |this, _cx| {
+                        let ms = 60_000 / this.sb.bpm as u64;
+                        (ms, this.sb.is_playing)
+                    })
+                    .unwrap_or((500, false));
+
+                if !still_playing {
+                    break;
+                }
+
+                smol::Timer::after(std::time::Duration::from_millis(interval_ms)).await;
+
+                let cont = this
+                    .update(cx, |this, cx| {
+                        if !this.sb.is_playing {
+                            return false;
+                        }
+                        this.sb.trigger_count += 1;
+                        this.sb.current_step =
+                            (this.sb.current_step + 1) % this.sb.n_triggers;
+                        if let Some(ref h) = this.soundboard_handle {
+                            let _ = h.cmd_tx.try_send(soundboard::SbCommand::PlayNote {
+                                midi: this.sb.root_midi,
+                                waveform: this.sb.waveform,
+                                instrument: this.sb.instrument,
+                                chord: this.sb.chord,
+                                volume: this.sb.volume,
+                            });
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+
+                if !cont {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn render_soundboard_view(&mut self, cx: &mut Context<Self>) -> Div {
+        let waveform = self.sb.waveform;
+        let instrument = self.sb.instrument;
+        let root_midi = self.sb.root_midi;
+        let chord = self.sb.chord;
+        let bpm = self.sb.bpm;
+        let n_triggers = self.sb.n_triggers;
+        let volume = self.sb.volume;
+        let is_playing = self.sb.is_playing;
+        let current_step = self.sb.current_step;
+        let trigger_count = self.sb.trigger_count;
+
+        // ── Transport ────────────────────────────────────────────────────────
+        let play_stop_btn = if is_playing {
+            Button::new("sb-stop")
+                .label("■ Stop")
+                .danger()
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.sb.is_playing = false;
+                    cx.notify();
+                }))
+        } else {
+            Button::new("sb-play")
+                .primary()
+                .label("▶ Play")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.sb_start(cx);
+                }))
+        };
+
+        let trigger_btn = Button::new("sb-trigger-now")
+            .label("▷ Trigger")
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.sb_play_note();
+                cx.notify();
+            }));
+
+        let bpm_ctrl = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("BPM"),
+            )
+            .child(Button::new("sb-bpm-dn").label("−").on_click(cx.listener(
+                |this, _, _window, cx| {
+                    this.sb.bpm = this.sb.bpm.saturating_sub(5).max(20);
+                    cx.notify();
+                },
+            )))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(cx.theme().foreground)
+                    .w(px(36.0))
+                    .child(format!("{bpm}")),
+            )
+            .child(Button::new("sb-bpm-up").label("+").on_click(cx.listener(
+                |this, _, _window, cx| {
+                    this.sb.bpm = (this.sb.bpm + 5).min(240);
+                    cx.notify();
+                },
+            )));
+
+        let n_ctrl = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("N"),
+            )
+            .child(Button::new("sb-n-dn").label("−").on_click(cx.listener(
+                |this, _, _window, cx| {
+                    this.sb.n_triggers = this.sb.n_triggers.saturating_sub(1).max(1);
+                    cx.notify();
+                },
+            )))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(cx.theme().foreground)
+                    .w(px(24.0))
+                    .child(format!("{n_triggers}")),
+            )
+            .child(Button::new("sb-n-up").label("+").on_click(cx.listener(
+                |this, _, _window, cx| {
+                    this.sb.n_triggers = (this.sb.n_triggers + 1).min(16);
+                    cx.notify();
+                },
+            )));
+
+        let vol_ctrl = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Vol"),
+            )
+            .child(Button::new("sb-vol-dn").label("−").on_click(cx.listener(
+                |this, _, _window, cx| {
+                    this.sb.volume = (this.sb.volume - 0.05).max(0.0);
+                    cx.notify();
+                },
+            )))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .w(px(38.0))
+                    .child(format!("{:.0}%", volume * 100.0)),
+            )
+            .child(Button::new("sb-vol-up").label("+").on_click(cx.listener(
+                |this, _, _window, cx| {
+                    this.sb.volume = (this.sb.volume + 0.05).min(1.0);
+                    cx.notify();
+                },
+            )));
+
+        let transport_row = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(play_stop_btn)
+            .child(trigger_btn)
+            .child(bpm_ctrl)
+            .child(n_ctrl)
+            .child(vol_ctrl);
+
+        // ── Waveform grid (2×2) ──────────────────────────────────────────────
+        let all_waves = [
+            soundboard::SbWaveform::Sine,
+            soundboard::SbWaveform::Sawtooth,
+            soundboard::SbWaveform::Triangle,
+            soundboard::SbWaveform::Square,
+        ];
+        let mut wave_row1 = div().flex().gap_2();
+        let mut wave_row2 = div().flex().gap_2();
+        for (i, &w) in all_waves.iter().enumerate() {
+            let label = w.label().to_string();
+            let btn = if waveform == w {
+                Button::new(SharedString::from(format!("sb-w-{i}")))
+                    .label(label)
+                    .primary()
+            } else {
+                Button::new(SharedString::from(format!("sb-w-{i}")))
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.sb.waveform = w;
+                        cx.notify();
+                    }))
+            };
+            if i < 2 {
+                wave_row1 = wave_row1.child(btn);
+            } else {
+                wave_row2 = wave_row2.child(btn);
+            }
+        }
+        let wave_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("WAVEFORM"),
+            )
+            .child(wave_row1)
+            .child(wave_row2);
+
+        // ── Instrument grid (2×2) ────────────────────────────────────────────
+        let all_insts = [
+            soundboard::SbInstrument::Kick,
+            soundboard::SbInstrument::Snare,
+            soundboard::SbInstrument::Piano,
+            soundboard::SbInstrument::Strings,
+        ];
+        let mut inst_row1 = div().flex().gap_2();
+        let mut inst_row2 = div().flex().gap_2();
+        for (i, &inst) in all_insts.iter().enumerate() {
+            let label = inst.label().to_string();
+            let btn = if instrument == inst {
+                Button::new(SharedString::from(format!("sb-i-{i}")))
+                    .label(label)
+                    .primary()
+            } else {
+                Button::new(SharedString::from(format!("sb-i-{i}")))
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.sb.instrument = inst;
+                        cx.notify();
+                    }))
+            };
+            if i < 2 {
+                inst_row1 = inst_row1.child(btn);
+            } else {
+                inst_row2 = inst_row2.child(btn);
+            }
+        }
+        let inst_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("INSTRUMENT"),
+            )
+            .child(inst_row1)
+            .child(inst_row2);
+
+        // ── Root note ────────────────────────────────────────────────────────
+        const SB_NOTES: &[(&str, u8)] = &[
+            ("C4", 60), ("D4", 62), ("E4", 64), ("F4", 65), ("G4", 67),
+            ("A4", 69), ("B4", 71), ("C5", 72), ("D5", 74), ("E5", 76),
+        ];
+        let mut note_row = div().flex().gap_1();
+        for &(name, midi) in SB_NOTES {
+            let label = name.to_string();
+            let btn = if root_midi == midi {
+                Button::new(SharedString::from(format!("sb-note-{midi}")))
+                    .label(label)
+                    .primary()
+            } else {
+                Button::new(SharedString::from(format!("sb-note-{midi}")))
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.sb.root_midi = midi;
+                        this.sb_play_note();
+                        cx.notify();
+                    }))
+            };
+            note_row = note_row.child(btn);
+        }
+
+        // ── Chord ────────────────────────────────────────────────────────────
+        let all_chords = [
+            soundboard::SbChord::Single,
+            soundboard::SbChord::Major,
+            soundboard::SbChord::Minor,
+            soundboard::SbChord::Dom7,
+            soundboard::SbChord::Sus4,
+        ];
+        let mut chord_row = div().flex().gap_1();
+        for (i, &ch) in all_chords.iter().enumerate() {
+            let label = ch.label().to_string();
+            let btn = if chord == ch {
+                Button::new(SharedString::from(format!("sb-ch-{i}")))
+                    .label(label)
+                    .primary()
+            } else {
+                Button::new(SharedString::from(format!("sb-ch-{i}")))
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.sb.chord = ch;
+                        cx.notify();
+                    }))
+            };
+            chord_row = chord_row.child(btn);
+        }
+
+        // ── Sequence display ─────────────────────────────────────────────────
+        let mut seq_row = div().flex().gap_1();
+        for step in 0..n_triggers {
+            let is_active = is_playing && step == current_step;
+            let step_el = div()
+                .w(px(28.0))
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .rounded_sm()
+                .border_1()
+                .border_color(if is_active {
+                    gpui::hsla(0.33, 0.7, 0.5, 1.0)
+                } else {
+                    cx.theme().border
+                })
+                .bg(if is_active {
+                    gpui::hsla(0.33, 0.7, 0.25, 1.0)
+                } else {
+                    cx.theme().background
+                })
+                .text_color(if is_active {
+                    gpui::hsla(0.33, 0.9, 0.75, 1.0)
+                } else {
+                    cx.theme().muted_foreground
+                })
+                .child(format!("{}", step + 1));
+            seq_row = seq_row.child(step_el);
+        }
+
+        // ── Assemble ─────────────────────────────────────────────────────────
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(transport_row)
+            .child(div().flex().gap_6().child(wave_section).child(inst_section))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("ROOT NOTE"),
+                    )
+                    .child(note_row),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("CHORD"),
+                    )
+                    .child(chord_row),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "SEQUENCE  ·  {trigger_count} triggers fired"
+                            )),
+                    )
+                    .child(seq_row),
+            )
     }
 }
 
