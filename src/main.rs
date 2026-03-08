@@ -534,9 +534,9 @@ impl MindDaw {
         cx.notify();
     }
 
-    fn cog_connect(&mut self, address: [u8; 6], cx: &mut Context<Self>) {
+    fn cog_connect(&mut self, id: String, cx: &mut Context<Self>) {
         if let Some(ref handle) = self.cog_handle {
-            let _ = handle.cmd_tx.send(CogCommand::Connect(address));
+            let _ = handle.cmd_tx.send(CogCommand::Connect(id));
         }
         self.cog_state = CogState::Connecting;
         cx.notify();
@@ -891,8 +891,8 @@ impl MindDaw {
                     ),
             ),
 
-            CogState::Found { address, name } => {
-                let addr = *address;
+            CogState::Found { id, name } => {
+                let device_id = id.clone();
                 let label = format!("Connect to {name}");
                 panel.child(
                     div()
@@ -910,7 +910,7 @@ impl MindDaw {
                                 .primary()
                                 .label(label)
                                 .on_click(cx.listener(move |this, _, _window, cx| {
-                                    this.cog_connect(addr, cx);
+                                    this.cog_connect(device_id.clone(), cx);
                                 })),
                         ),
                 )

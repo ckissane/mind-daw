@@ -26,7 +26,7 @@ pub struct CogSample {
 pub enum CogState {
     Disconnected,
     Scanning,
-    Found { address: [u8; 6], name: String },
+    Found { id: String, name: String },
     Connecting,
     Streaming,
     Error(String),
@@ -35,7 +35,7 @@ pub enum CogState {
 /// Commands sent from the main thread to the BT worker.
 pub enum CogCommand {
     StartScan,
-    Connect([u8; 6]),
+    Connect(String),
     Disconnect,
     Shutdown,
 }
@@ -113,8 +113,8 @@ pub fn spawn_cog_worker() -> CogHandle {
     }
 }
 
-/// Stub implementation for non-Linux platforms (BlueZ/bluer is Linux-only).
-#[cfg(not(target_os = "linux"))]
+/// Stub implementation for unsupported platforms.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn spawn_cog_worker() -> CogHandle {
     let (cmd_tx, _cmd_rx) = mpsc::channel::<CogCommand>();
     let (_sample_tx, sample_rx) = mpsc::sync_channel::<CogSample>(1);
@@ -127,7 +127,7 @@ pub fn spawn_cog_worker() -> CogHandle {
 }
 
 /// Send a state update, ignoring disconnected receiver.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn send_state(tx: &mpsc::Sender<CogState>, state: CogState) {
     eprintln!("[cog] state -> {state:?}");
     let _ = tx.send(state);
@@ -150,11 +150,11 @@ async fn worker_loop(
             CogCommand::StartScan => {
                 send_state(&state_tx, CogState::Scanning);
                 match scan_for_device().await {
-                    Ok((addr, name)) => {
+                    Ok((addr_str, name)) => {
                         send_state(
                             &state_tx,
                             CogState::Found {
-                                address: addr,
+                                id: addr_str,
                                 name,
                             },
                         );
@@ -164,9 +164,19 @@ async fn worker_loop(
                     }
                 }
             }
-            CogCommand::Connect(addr) => {
+            CogCommand::Connect(addr_str) => {
                 send_state(&state_tx, CogState::Connecting);
-                match connect_and_stream(addr, &cmd_rx, &sample_tx, &state_tx).await {
+                let addr: bluer::Address = match addr_str.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        send_state(
+                            &state_tx,
+                            CogState::Error(format!("Bad address: {e}")),
+                        );
+                        continue;
+                    }
+                };
+                match connect_and_stream(addr.0, &cmd_rx, &sample_tx, &state_tx).await {
                     Ok(()) => {
                         send_state(&state_tx, CogState::Disconnected);
                     }
@@ -189,7 +199,7 @@ async fn worker_loop(
 
 /// Scan for a Cognionics HD-72 device via Bluetooth Classic (BR/EDR).
 #[cfg(target_os = "linux")]
-async fn scan_for_device() -> Result<([u8; 6], String), bluer::Error> {
+async fn scan_for_device() -> Result<(String, String), bluer::Error> {
     use bluer::AdapterEvent;
     use futures::StreamExt;
 
@@ -224,8 +234,7 @@ async fn scan_for_device() -> Result<([u8; 6], String), bluer::Error> {
                         eprintln!("[cog] scan: found device {addr} name={name:?}");
                         if name.contains("HD-72") || name.contains("Cognionics") {
                             eprintln!("[cog] scan: matched Cognionics device!");
-                            let addr_bytes = addr.0;
-                            return Ok((addr_bytes, name));
+                            return Ok((addr.to_string(), name));
                         }
                     } else {
                         eprintln!("[cog] scan: found device {addr} (no name)");
@@ -340,6 +349,196 @@ async fn connect_and_stream(
                 );
             }
             // If the channel is full, drop the sample (backpressure)
+            let _ = sample_tx.try_send(sample);
+        }
+    }
+
+    eprintln!("[cog] connect: read loop ended, total packets={packet_count}");
+    Ok(())
+}
+
+// ── macOS codepath ──────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+pub fn spawn_cog_worker() -> CogHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CogCommand>();
+    let (sample_tx, sample_rx) = mpsc::sync_channel::<CogSample>(1024);
+    let (state_tx, state_rx) = mpsc::channel::<CogState>();
+
+    std::thread::Builder::new()
+        .name("cog-bt-worker".into())
+        .spawn(move || {
+            worker_loop_macos(cmd_rx, sample_tx, state_tx);
+        })
+        .expect("failed to spawn BT worker thread");
+
+    CogHandle {
+        cmd_tx,
+        sample_rx,
+        state_rx,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn worker_loop_macos(
+    cmd_rx: mpsc::Receiver<CogCommand>,
+    sample_tx: mpsc::SyncSender<CogSample>,
+    state_tx: mpsc::Sender<CogState>,
+) {
+    loop {
+        let cmd = match cmd_rx.recv() {
+            Ok(cmd) => cmd,
+            Err(_) => break,
+        };
+
+        match cmd {
+            CogCommand::StartScan => {
+                send_state(&state_tx, CogState::Scanning);
+                match scan_for_device_macos() {
+                    Ok((port_path, name)) => {
+                        send_state(
+                            &state_tx,
+                            CogState::Found {
+                                id: port_path,
+                                name,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        send_state(&state_tx, CogState::Error(format!("Scan failed: {e}")));
+                    }
+                }
+            }
+            CogCommand::Connect(port) => {
+                send_state(&state_tx, CogState::Connecting);
+                match connect_and_stream_macos(&port, &cmd_rx, &sample_tx, &state_tx) {
+                    Ok(()) => {
+                        send_state(&state_tx, CogState::Disconnected);
+                    }
+                    Err(e) => {
+                        send_state(
+                            &state_tx,
+                            CogState::Error(format!("Connection error: {e}")),
+                        );
+                    }
+                }
+            }
+            CogCommand::Disconnect => {
+                send_state(&state_tx, CogState::Disconnected);
+            }
+            CogCommand::Shutdown => break,
+        }
+    }
+}
+
+/// Scan for a Cognionics device by searching macOS virtual serial ports.
+/// Paired Bluetooth SPP devices appear as `/dev/cu.<DeviceName>*`.
+#[cfg(target_os = "macos")]
+fn scan_for_device_macos() -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("[cog] scan: listing serial ports...");
+    let ports = serialport::available_ports()?;
+
+    for port in &ports {
+        eprintln!("[cog] scan: port {:?}", port.port_name);
+    }
+
+    for port in &ports {
+        let name = &port.port_name;
+        let upper = name.to_uppercase();
+        if upper.contains("HD-72") || upper.contains("HD72") || upper.contains("COGNIONICS") {
+            eprintln!("[cog] scan: matched Cognionics port: {name}");
+            // Use the filename portion as the display name
+            let display = name
+                .rsplit('/')
+                .next()
+                .unwrap_or(name)
+                .strip_prefix("cu.")
+                .unwrap_or(name);
+            return Ok((name.clone(), display.to_string()));
+        }
+    }
+
+    Err("No Cognionics serial port found — is the device paired?".into())
+}
+
+/// Open the serial port, send impedance-off, and enter a sync-byte-aligned read loop.
+#[cfg(target_os = "macos")]
+fn connect_and_stream_macos(
+    port_path: &str,
+    cmd_rx: &mpsc::Receiver<CogCommand>,
+    sample_tx: &mpsc::SyncSender<CogSample>,
+    state_tx: &mpsc::Sender<CogState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    eprintln!("[cog] connect: opening {port_path} at 1500000 baud...");
+    let mut port = serialport::new(port_path, 1_500_000)
+        .data_bits(serialport::DataBits::Eight)
+        .parity(serialport::Parity::None)
+        .stop_bits(serialport::StopBits::One)
+        .timeout(Duration::from_millis(500))
+        .open()?;
+
+    eprintln!("[cog] connect: sending impedance-off (0x{IMPEDANCE_OFF_CMD:02X})...");
+    port.write_all(&[IMPEDANCE_OFF_CMD])?;
+    port.flush()?;
+    eprintln!("[cog] connect: impedance-off sent, entering read loop");
+
+    send_state(state_tx, CogState::Streaming);
+
+    let mut packet_buf = [0u8; PACKET_SIZE];
+    let mut single = [0u8; 1];
+    let mut packet_count: u64 = 0;
+    let mut sync_miss: u64 = 0;
+
+    loop {
+        // Check for disconnect command (non-blocking)
+        match cmd_rx.try_recv() {
+            Ok(CogCommand::Disconnect) | Ok(CogCommand::Shutdown) => {
+                eprintln!("[cog] read: disconnect requested after {packet_count} packets");
+                break;
+            }
+            _ => {}
+        }
+
+        // Sync: read byte-by-byte until we find the sync byte
+        loop {
+            match port.read_exact(&mut single) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Check for disconnect during timeout
+                    match cmd_rx.try_recv() {
+                        Ok(CogCommand::Disconnect) | Ok(CogCommand::Shutdown) => {
+                            eprintln!(
+                                "[cog] read: disconnect requested after {packet_count} packets"
+                            );
+                            return Ok(());
+                        }
+                        _ => continue,
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+            if single[0] == SYNC_BYTE {
+                packet_buf[0] = SYNC_BYTE;
+                break;
+            }
+            sync_miss += 1;
+        }
+
+        // Read the remaining 194 bytes
+        port.read_exact(&mut packet_buf[1..])?;
+
+        // Parse and send
+        if let Some(sample) = parse_packet(&packet_buf) {
+            packet_count += 1;
+            if packet_count <= 3 || packet_count % 300 == 0 {
+                eprintln!(
+                    "[cog] read: pkt#{packet_count} counter={} status=0x{:02X} ch0={:.1}uV sync_misses={sync_miss}",
+                    sample.counter, sample.status, sample.channels[0]
+                );
+            }
             let _ = sample_tx.try_send(sample);
         }
     }
