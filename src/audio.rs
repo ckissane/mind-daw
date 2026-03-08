@@ -21,6 +21,63 @@ pub struct AudioHandle {
     pub cmd_tx: mpsc::SyncSender<AudioCommand>,
 }
 
+/// Find an output device that can actually be opened.
+///
+/// cpal's `default_output_device()` uses ALSA's `"default"` PCM which may
+/// resolve to an unusable HDMI device.  We try the default first, then fall
+/// back to any device that reports a valid output config.
+pub fn find_output_device() -> anyhow::Result<cpal::Device> {
+    let host = cpal::default_host();
+
+    // Try default first.
+    if let Some(dev) = host.default_output_device() {
+        if dev.default_output_config().is_ok() {
+            // Attempt a quick probe: build (and immediately drop) a tiny stream.
+            let cfg = dev.default_output_config().unwrap();
+            let config = cpal::StreamConfig {
+                channels: cfg.channels(),
+                sample_rate: cfg.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            };
+            if let Ok(stream) = dev.build_output_stream(
+                &config,
+                |_data: &mut [f32], _: &cpal::OutputCallbackInfo| {},
+                |_| {},
+                None,
+            ) {
+                drop(stream);
+                return Ok(dev);
+            }
+        }
+    }
+
+    // Default failed — scan all output devices for one that works.
+    if let Ok(devices) = host.output_devices() {
+        for dev in devices {
+            if let Ok(cfg) = dev.default_output_config() {
+                let config = cpal::StreamConfig {
+                    channels: cfg.channels(),
+                    sample_rate: cfg.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                };
+                if let Ok(stream) = dev.build_output_stream(
+                    &config,
+                    |_data: &mut [f32], _: &cpal::OutputCallbackInfo| {},
+                    |_| {},
+                    None,
+                ) {
+                    drop(stream);
+                    let name = dev.name().unwrap_or_default();
+                    eprintln!("audio: using fallback device: {name}");
+                    return Ok(dev);
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("no usable audio output device found")
+}
+
 // ── Sonification pipeline ────────────────────────────────────────────────────
 
 const BINS_PER_CHANNEL: usize = 32;
@@ -232,10 +289,7 @@ fn audio_thread(
     num_channels: usize,
     fft_size: usize,
 ) -> anyhow::Result<()> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("no audio output device found"))?;
+    let device = find_output_device()?;
 
     let supported = device.default_output_config()?;
     let sample_rate = supported.sample_rate().0;

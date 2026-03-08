@@ -1,4 +1,4 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 
@@ -323,10 +323,7 @@ pub fn spawn_soundboard_engine() -> anyhow::Result<SoundboardHandle> {
 }
 
 fn soundboard_thread(cmd_rx: mpsc::Receiver<SbCommand>) -> anyhow::Result<()> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("no output device"))?;
+    let device = crate::audio::find_output_device()?;
     let supported = device.default_output_config()?;
     let sample_rate = supported.sample_rate().0 as f32;
     let channels = supported.channels() as usize;
