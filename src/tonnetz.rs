@@ -201,7 +201,6 @@ fn permute_inner(perm: &mut Vec<usize>, k: usize, f: &mut impl FnMut(&[usize])) 
 pub enum OrbifoldType {
     Dyads,   // T²/S₂ — Möbius strip
     Triads,  // T³/S₃
-    Tetrads, // T⁴/S₄
 }
 
 impl OrbifoldType {
@@ -209,7 +208,6 @@ impl OrbifoldType {
         match self {
             Self::Dyads => 2,
             Self::Triads => 3,
-            Self::Tetrads => 4,
         }
     }
 
@@ -217,7 +215,6 @@ impl OrbifoldType {
         match self {
             Self::Dyads => "T\u{00B2}/S\u{2082} Dyads",
             Self::Triads => "T\u{00B3}/S\u{2083} Triads",
-            Self::Tetrads => "T\u{2074}/S\u{2084} Tetrads",
         }
     }
 
@@ -256,54 +253,11 @@ impl OrbifoldType {
                 }
                 out
             }
-            Self::Tetrads => {
-                let mut out = Vec::new();
-                for root in 0..12u8 {
-                    out.push(Chord::from_semitones(root, &[0, 4, 7, 11])); // Maj7
-                    out.push(Chord::from_semitones(root, &[0, 4, 7, 10])); // dom7
-                    out.push(Chord::from_semitones(root, &[0, 3, 7, 10])); // min7
-                    out.push(Chord::from_semitones(root, &[0, 3, 6, 10])); // hdim7
-                }
-                for root in (0..12u8).step_by(3) {
-                    out.push(Chord::from_semitones(root, &[0, 3, 6, 9])); // dim7
-                }
-                out
-            }
         }
     }
 }
 
 // ── Layout algorithms ───────────────────────────────────────────────────────
-
-/// Tonnetz note layout: place the 12 pitch classes on a triangular lattice.
-/// Horizontal axis = major thirds (+4), NE diagonal = minor thirds (+3),
-/// NW diagonal = perfect fifths (+7). Returns (x, y) for each of 12 PCs.
-///
-/// We tile a few periods so chords don't wrap weirdly.
-pub fn tonnetz_note_positions() -> Vec<(u8, f32, f32)> {
-    // The classic Tonnetz is a planar tiling. We generate a grid where:
-    //   moving right = +4 semitones (major third)
-    //   moving up-right = +3 semitones (minor third)
-    //   moving up-left = +7 semitones (perfect fifth)
-    //
-    // We lay out a hex-ish grid and label each position with its pitch class.
-    let mut notes = Vec::new();
-    let dx = 60.0f32; // horizontal spacing (major third)
-    let dy = 52.0f32; // vertical spacing
-
-    // Generate a grid of pitch classes
-    for row in -2i32..=3 {
-        for col in -3i32..=4 {
-            // Each row shifts by +3 semitones (minor third up from previous row)
-            // Each col shifts by +4 semitones (major third right)
-            let pc = ((row * 3 + col * 4) as i32).rem_euclid(12) as u8;
-            let x = col as f32 * dx + row as f32 * dx * 0.5;
-            let y = -(row as f32) * dy; // negative so up is positive
-            notes.push((pc, x, y));
-        }
-    }
-    notes
-}
 
 /// Orbifold T²/S₂ (Möbius strip) layout, matching Tymoczko Science 2006 Fig.2.
 ///
@@ -358,28 +312,6 @@ pub fn triad_prism_layout(chord: &Chord) -> (f32, f32) {
     (x, y)
 }
 
-/// Legacy alias — kept for compatibility.
-pub fn triad_orbifold_layout(chord: &Chord) -> (f32, f32) {
-    triad_prism_layout(chord)
-}
-
-/// For tetrads: position in T⁴/S₄.
-pub fn tetrad_orbifold_layout(chord: &Chord) -> (f32, f32) {
-    assert!(chord.n() == 4);
-    let avg = chord.pcs.iter().sum::<f32>() / 4.0;
-    let x = avg.rem_euclid(12.0);
-
-    let even = 3.0; // 12/4
-    let mut dev = 0.0f32;
-    for i in 0..4 {
-        let next = (i + 1) % 4;
-        let interval = (chord.pcs[next] - chord.pcs[i]).rem_euclid(12.0);
-        dev += (interval - even).powi(2);
-    }
-    let y = dev.sqrt();
-    (x, y)
-}
-
 // ── Graph structures ────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -398,7 +330,6 @@ pub struct TonnetzNode {
 /// Dyads: (transposition, interval, 0) — 2D Möbius strip embedded in 3D.
 /// Triads: (transposition, shape_y, shape_z) — 3D twisted prism.
 ///   Shape coordinates come from barycentric projection of the interval simplex.
-/// Tetrads: (transposition, shape_y, shape_z) — projected from 4D.
 fn chord_to_3d(chord: &Chord, orbifold: OrbifoldType) -> (f32, f32, f32) {
     match orbifold {
         OrbifoldType::Dyads => {
@@ -418,21 +349,6 @@ fn chord_to_3d(chord: &Chord, orbifold: OrbifoldType) -> (f32, f32, f32) {
             let z = (2.0 * i3 - i1 - i2) / 6.0f32.sqrt();
             (x, y, z)
         }
-        OrbifoldType::Tetrads => {
-            let avg = chord.pcs.iter().sum::<f32>() / 4.0;
-            let x = avg.rem_euclid(12.0);
-            // Four intervals
-            let mut intervals = [0.0f32; 4];
-            for k in 0..4 {
-                intervals[k] = (chord.pcs[(k + 1) % 4] - chord.pcs[k]).rem_euclid(12.0);
-            }
-            // Project 3-simplex (4 intervals summing to 12) to 3D
-            // Using standard simplex basis vectors
-            let y = (intervals[0] - intervals[1]) / 2.0f32.sqrt();
-            let z = (intervals[0] + intervals[1] - 2.0 * intervals[2]) / 6.0f32.sqrt();
-            // Third shape dimension (we project to 2D for display, using z)
-            (x, y, z)
-        }
     }
 }
 
@@ -448,7 +364,6 @@ pub fn build_graph(orbifold: OrbifoldType) -> (Vec<TonnetzNode>, Vec<TonnetzEdge
     let threshold = match orbifold {
         OrbifoldType::Dyads => 2.0,
         OrbifoldType::Triads => 2.5,
-        OrbifoldType::Tetrads => 3.0,
     };
 
     let nodes: Vec<TonnetzNode> = chords
@@ -457,7 +372,6 @@ pub fn build_graph(orbifold: OrbifoldType) -> (Vec<TonnetzNode>, Vec<TonnetzEdge
             let (ox, oy) = match orbifold {
                 OrbifoldType::Dyads => mobius_strip_layout(chord),
                 OrbifoldType::Triads => triad_prism_layout(chord),
-                OrbifoldType::Tetrads => tetrad_orbifold_layout(chord),
             };
             let (_, _, oz) = chord_to_3d(chord, orbifold);
             TonnetzNode {
@@ -494,39 +408,19 @@ pub struct TonnetzState {
     pub orbifold: OrbifoldType,
     pub nodes: Vec<TonnetzNode>,
     pub edges: Vec<TonnetzEdge>,
-    pub note_positions: Vec<(u8, f32, f32)>,
 
     pub current_chord_idx: usize,
     pub chord_trail: VecDeque<usize>,
     pub position: [f32; 3],
     pub position_trail: VecDeque<[f32; 3]>,
 
-    pub viz_mode: VizMode,
     pub yaw: f32,
     pub pitch: f32,
     pub dragging: bool,
     pub last_drag_pos: Option<(f32, f32)>,
 
     pub nav_velocity: [f32; 3],
-    pub nav_smoothing: f32,
     pub zoom: f32,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum VizMode {
-    Tonnetz,    // Classic note-based tonnetz lattice
-    Orbifold,   // Tymoczko orbifold fundamental domain
-    ChordSpace, // 3D rotatable projection
-}
-
-impl VizMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Tonnetz => "Tonnetz",
-            Self::Orbifold => "Orbifold",
-            Self::ChordSpace => "Chord Space",
-        }
-    }
 }
 
 impl TonnetzState {
@@ -536,18 +430,15 @@ impl TonnetzState {
             orbifold,
             nodes,
             edges,
-            note_positions: tonnetz_note_positions(),
             current_chord_idx: 0,
             chord_trail: VecDeque::with_capacity(TRAIL_LEN),
             position: [3.0, 6.0, 0.0], // center of [0,6]×[0,12] domain
             position_trail: VecDeque::with_capacity(TRAIL_LEN),
-            viz_mode: VizMode::Tonnetz,
             yaw: 0.0,
             pitch: 0.0,
             dragging: false,
             last_drag_pos: None,
             nav_velocity: [0.0; 3],
-            nav_smoothing: 0.85,
             zoom: 1.0,
         }
     }
@@ -565,19 +456,6 @@ impl TonnetzState {
         self.position = [period / 2.0, 0.0, 0.0];
         self.nav_velocity = [0.0; 3];
         self.zoom = 1.0;
-    }
-
-    pub fn update_from_brain(&mut self, brain_signal: [f32; 3]) {
-        for i in 0..3 {
-            self.nav_velocity[i] =
-                self.nav_smoothing * self.nav_velocity[i]
-                    + (1.0 - self.nav_smoothing) * brain_signal[i];
-        }
-        let speed = 0.15;
-        for i in 0..3 {
-            self.position[i] += self.nav_velocity[i] * speed;
-        }
-        self.clamp_and_snap();
     }
 
     /// Update from a ControlState (the calibrated decoder output).
@@ -690,98 +568,6 @@ impl TonnetzState {
     }
 }
 
-/// Prepare rendering data for the tonnetz note-based view.
-/// Returns: note_dots (pc, x, y), chord_triangles (indices into note_dots, is_current, hue_idx)
-pub fn prepare_tonnetz_render(
-    state: &TonnetzState,
-) -> (
-    Vec<(u8, f32, f32)>,                  // note positions
-    Vec<(Vec<usize>, bool, u8, String)>,  // chord shapes: (note indices, is_current, hue_idx, label)
-) {
-    let notes = &state.note_positions;
-
-    // For each chord, find which note positions match its pitch classes
-    let mut chord_shapes = Vec::new();
-    for (ci, node) in state.nodes.iter().enumerate() {
-        let is_current = ci == state.current_chord_idx;
-
-        // Find a connected cluster of note positions that form this chord.
-        // We need one note position per pitch class, and they should be close together.
-        let pcs: Vec<u8> = node.chord.pcs.iter().map(|&p| p.round() as u8 % 12).collect();
-
-        // For each pc, collect candidate note indices
-        let candidates: Vec<Vec<usize>> = pcs
-            .iter()
-            .map(|&pc| {
-                notes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (n, _, _))| *n == pc)
-                    .map(|(i, _)| i)
-                    .collect()
-            })
-            .collect();
-
-        // Find the combination of candidates that minimizes total distance
-        if candidates.iter().any(|c| c.is_empty()) {
-            continue;
-        }
-
-        let best = find_closest_cluster(notes, &candidates);
-        chord_shapes.push((
-            best,
-            is_current,
-            node.chord.hue_index(),
-            node.chord.short_label(),
-        ));
-    }
-
-    (notes.clone(), chord_shapes)
-}
-
-/// Find the combination of note positions (one per voice) that minimizes spread.
-fn find_closest_cluster(
-    notes: &[(u8, f32, f32)],
-    candidates: &[Vec<usize>],
-) -> Vec<usize> {
-    if candidates.len() == 1 {
-        return vec![candidates[0][0]];
-    }
-
-    // For triads/dyads (small n), brute-force the combinations
-    // For efficiency, anchor on the first voice's candidates and find nearest others
-    let mut best_combo = vec![0usize; candidates.len()];
-    let mut best_spread = f32::INFINITY;
-
-    for &anchor in &candidates[0] {
-        let (ax, ay) = (notes[anchor].1, notes[anchor].2);
-        let mut combo = vec![anchor];
-        let mut total_dist = 0.0f32;
-
-        for voice in 1..candidates.len() {
-            let mut nearest = candidates[voice][0];
-            let mut nearest_d = f32::INFINITY;
-            for &idx in &candidates[voice] {
-                let dx = notes[idx].1 - ax;
-                let dy = notes[idx].2 - ay;
-                let d = dx * dx + dy * dy;
-                if d < nearest_d {
-                    nearest_d = d;
-                    nearest = idx;
-                }
-            }
-            combo.push(nearest);
-            total_dist += nearest_d;
-        }
-
-        if total_dist < best_spread {
-            best_spread = total_dist;
-            best_combo = combo;
-        }
-    }
-    best_combo
-}
-
 /// Convert a chord's pitch classes to MIDI note numbers, centered around C4 (MIDI 60).
 /// Returns sorted MIDI notes in a comfortable middle register.
 pub fn chord_to_midi_notes(chord: &Chord) -> Vec<u8> {
@@ -794,50 +580,4 @@ pub fn chord_to_midi_notes(chord: &Chord) -> Vec<u8> {
             (60 + rounded.rem_euclid(12)) as u8
         })
         .collect()
-}
-
-/// Extract a 3-component brain navigation signal from EEG features.
-pub fn eeg_to_nav_signal(features: &[f32]) -> [f32; 3] {
-    if features.is_empty() {
-        return [0.0; 3];
-    }
-
-    let bins_per_ch = 32.min(features.len());
-    let n_ch = (features.len() / bins_per_ch).min(64);
-    if n_ch == 0 || bins_per_ch < 16 {
-        return [0.0; 3];
-    }
-
-    let ch_limit = n_ch.min(8);
-    let mut theta_power = 0.0f32;
-    let mut alpha_power = 0.0f32;
-    let mut beta_power = 0.0f32;
-    let mut gamma_power = 0.0f32;
-
-    for ch in 0..ch_limit {
-        let offset = ch * bins_per_ch;
-        for b in 1..=2 {
-            theta_power += features.get(offset + b).copied().unwrap_or(0.0).abs();
-        }
-        for b in 2..=3 {
-            alpha_power += features.get(offset + b).copied().unwrap_or(0.0).abs();
-        }
-        for b in 3..=6 {
-            beta_power += features.get(offset + b).copied().unwrap_or(0.0).abs();
-        }
-        for b in 7..=17.min(bins_per_ch - 1) {
-            gamma_power += features.get(offset + b).copied().unwrap_or(0.0).abs();
-        }
-    }
-
-    let norm = (theta_power + alpha_power + beta_power + gamma_power).max(1e-6);
-    let alpha_beta = (alpha_power - beta_power) / norm;
-    let theta_norm = (theta_power / norm - 0.25) * 4.0;
-    let gamma_norm = (gamma_power / norm - 0.1) * 5.0;
-
-    [
-        alpha_beta.clamp(-1.0, 1.0),
-        theta_norm.clamp(-1.0, 1.0),
-        gamma_norm.clamp(-1.0, 1.0),
-    ]
 }

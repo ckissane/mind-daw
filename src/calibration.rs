@@ -128,9 +128,6 @@ impl CalibrationProfile {
         BandPowers::from_array(out)
     }
 
-    pub fn is_good_channel(&self, ch: usize) -> bool {
-        self.good_channels.contains(&ch)
-    }
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -267,16 +264,8 @@ impl RefreshStep {
 pub struct ChannelDiag {
     /// Overall quality 0.0–1.0.
     pub quality: f32,
-    /// RMS amplitude (µV).
-    pub rms: f32,
-    /// 50/60 Hz line noise power ratio (0–1, lower is better).
-    pub line_noise_ratio: f32,
     /// True if channel appears flat / disconnected.
     pub flat: bool,
-    /// True if channel appears clipped / railed.
-    pub clipped: bool,
-    /// True if channel shows large slow drift.
-    pub drifting: bool,
 }
 
 // ── Calibration state ────────────────────────────────────────────────────────
@@ -659,11 +648,7 @@ impl CalibrationState {
 
             self.channel_diag[ch] = ChannelDiag {
                 quality,
-                rms,
-                line_noise_ratio,
                 flat,
-                clipped,
-                drifting,
             };
 
             self.noise_floor[ch] = rms;

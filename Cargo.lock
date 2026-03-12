@@ -3729,6 +3729,7 @@ dependencies = [
  "serialport",
  "smol",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

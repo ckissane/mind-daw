@@ -13,10 +13,6 @@ use std::time::Instant;
 /// engine consumes. All fields are continuously updated.
 #[derive(Clone, Debug)]
 pub struct ControlState {
-    /// Discrete target region (probability distribution over harmonic attractors).
-    /// Length matches the number of orbifold regions/chords.
-    pub target_region: Vec<f32>,
-
     /// Continuous 2D motion in orbifold space, each in [-1, 1].
     pub motion_x: f32,
     pub motion_y: f32,
@@ -45,7 +41,6 @@ pub struct ControlState {
 impl Default for ControlState {
     fn default() -> Self {
         Self {
-            target_region: Vec::new(),
             motion_x: 0.0,
             motion_y: 0.0,
             tension: 0.3,
@@ -66,13 +61,6 @@ impl ControlState {
         (self.confidence_discrete * self.confidence_continuous)
             .sqrt()
             .clamp(0.0, 1.0)
-    }
-
-    /// Consume the confirm event (returns true once, then clears).
-    pub fn take_confirm(&mut self) -> bool {
-        let v = self.confirm_event;
-        self.confirm_event = false;
-        v
     }
 
     /// Consume the reset event.

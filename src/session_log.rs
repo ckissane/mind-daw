@@ -26,7 +26,6 @@ struct LogEntry {
 pub struct SessionLog {
     writer: Option<BufWriter<File>>,
     start: Instant,
-    path: PathBuf,
 }
 
 impl SessionLog {
@@ -58,16 +57,7 @@ impl SessionLog {
         SessionLog {
             writer,
             start: Instant::now(),
-            path,
         }
-    }
-
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
-
-    fn elapsed(&self) -> f32 {
-        self.start.elapsed().as_secs_f32()
     }
 
     fn write_entry(&mut self, kind: &'static str, data: serde_json::Value) {
@@ -133,14 +123,6 @@ impl SessionLog {
                 "label": chord_label,
                 "midi": midi_notes,
             }),
-        );
-    }
-
-    /// Log a user event (confirm, reset, freeze toggle, etc.)
-    pub fn log_event(&mut self, event: &str) {
-        self.write_entry(
-            "event",
-            serde_json::json!({ "name": event }),
         );
     }
 
