@@ -1,5 +1,11 @@
 mod audio;
+#[allow(dead_code)]
+mod calibration;
 mod cognionics;
+#[allow(dead_code)]
+mod control;
+#[allow(dead_code)]
+mod session_log;
 mod soundboard;
 mod streams;
 #[allow(dead_code)]
@@ -7,7 +13,9 @@ mod tonnetz;
 mod word_read;
 
 use audio::{AudioCommand, AudioHandle, EegFrame};
+use calibration::CalibrationState;
 use cognionics::{CogCommand, CogHandle, CogState};
+use control::{ControlDecoder, ControlState};
 use word_read::WordReadState;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
@@ -24,6 +32,7 @@ enum Tab {
     Words,
     Soundboard,
     Tonnetz,
+    Calibration,
 }
 
 struct SoundboardUiState {
@@ -67,7 +76,7 @@ enum BrainWaveBand {
 }
 
 const SPECTRUM_FFT_SIZE: usize = 128;
-const SPECTRUM_SAMPLE_RATE: f32 = 300.0;
+const SPECTRUM_SAMPLE_RATE: f32 = cognionics::SAMPLE_RATE as f32;
 
 impl BrainWaveBand {
     fn label(self) -> &'static str {
@@ -157,6 +166,23 @@ struct MindDaw {
     tonnetz_state: tonnetz::TonnetzState,
     prev_tonnetz_chord_idx: usize,
     tonnetz_muted: bool,
+
+    // Calibration & Control
+    calibration_state: CalibrationState,
+    control_state: ControlState,
+    control_decoder: ControlDecoder,
+    session_log: Option<session_log::SessionLog>,
+    /// Frame counter for throttled logging (log every N frames).
+    log_frame_counter: u32,
+
+    // Live detection display
+    /// Recent detected events with timestamps for display.
+    detected_events: std::collections::VecDeque<(std::time::Instant, &'static str)>,
+    /// Current detected state flags (updated every frame).
+    detecting_blink: bool,
+    detecting_jaw_clench: bool,
+    /// Band power snapshot for display.
+    live_band_powers: calibration::BandPowers,
 }
 
 const COG_BUFFER_CAPACITY: usize = 150;
@@ -382,6 +408,17 @@ impl MindDaw {
             tonnetz_state: tonnetz::TonnetzState::new(tonnetz::OrbifoldType::Dyads),
             prev_tonnetz_chord_idx: 0,
             tonnetz_muted: true,
+
+            calibration_state: CalibrationState::new(cognionics::NUM_CHANNELS),
+            control_state: ControlState::default(),
+            control_decoder: ControlDecoder::new(),
+            session_log: None,
+            log_frame_counter: 0,
+
+            detected_events: VecDeque::with_capacity(20),
+            detecting_blink: false,
+            detecting_jaw_clench: false,
+            live_band_powers: calibration::BandPowers::default(),
         }
     }
 
@@ -425,10 +462,10 @@ impl MindDaw {
                                         (0..ch).map(|c| paired.channel_data(c)).collect();
 
                                     // Send audio frame (build inline to avoid borrow conflict)
-                                    // Disable EEG sonification on the Tonnetz tab (it
-                                    // produces static noise that drowns out chord audio).
+                                    // Disable EEG sonification on tabs where chord audio plays.
                                     if this.audio_enabled
                                         && this.active_tab != Tab::Tonnetz
+                                        && this.active_tab != Tab::Calibration
                                     {
                                         if let Some(ref handle) = this.audio_handle {
                                             let frame = EegFrame {
@@ -443,6 +480,11 @@ impl MindDaw {
                                             let _ = handle.cmd_tx.try_send(AudioCommand::Frame(frame));
                                         }
                                     }
+
+                                    // Feed calibration from LSL data
+                                    this.calibration_state.feed_lsl_bufs(
+                                        &this.waveform_data, 0.033,
+                                    );
 
                                     cx.notify();
                                     true
@@ -637,9 +679,67 @@ impl MindDaw {
                             // Word reading update
                             this.word_read_state.tick(&features);
 
-                            // Tonnetz navigation from brain waves
-                            let nav = tonnetz::eeg_to_nav_signal(&features);
-                            this.tonnetz_state.update_from_brain(nav);
+                            // ── Calibrated EEG → ControlState → Tonnetz ──
+                            // Extract band powers from the feature vector
+                            let bands = control::extract_band_powers(
+                                &features, PCA_BINS, 64,
+                            );
+
+                            // Detect artifacts
+                            let blink = control::detect_blink(
+                                &this.cog_waveform_data,
+                                this.calibration_state.profile.as_ref(),
+                            );
+                            let jaw = control::detect_jaw_clench(
+                                &this.cog_waveform_data,
+                                this.calibration_state.profile.as_ref(),
+                            );
+
+                            // Store detection state for UI
+                            this.detecting_blink = blink;
+                            this.detecting_jaw_clench = jaw;
+                            this.live_band_powers = bands.clone();
+                            let now = std::time::Instant::now();
+                            if blink {
+                                this.detected_events.push_back((now, "Blink"));
+                            }
+                            if jaw {
+                                this.detected_events.push_back((now, "Jaw clench"));
+                            }
+                            // Keep only last 20 events and prune old ones (> 5s)
+                            while this.detected_events.len() > 20 {
+                                this.detected_events.pop_front();
+                            }
+                            while this.detected_events.front()
+                                .is_some_and(|(t, _)| t.elapsed().as_secs_f32() > 5.0)
+                            {
+                                this.detected_events.pop_front();
+                            }
+
+                            // Channel variance for confidence estimation
+                            let ch_var = this.cog_waveform_data.iter()
+                                .take(8)
+                                .filter_map(|d| {
+                                    if d.is_empty() { return None; }
+                                    let mean = d.iter().sum::<f32>() / d.len() as f32;
+                                    Some(d.iter().map(|x| (x - mean).powi(2))
+                                        .sum::<f32>() / d.len() as f32)
+                                })
+                                .sum::<f32>() / 8.0;
+
+                            // Decode into ControlState
+                            this.control_decoder.decode(
+                                &bands,
+                                blink,
+                                jaw,
+                                ch_var,
+                                this.calibration_state.profile.as_ref(),
+                                0.033, // ~30 Hz frame rate
+                                &mut this.control_state,
+                            );
+
+                            // Navigate orbifold using ControlState (confidence-weighted)
+                            this.tonnetz_state.update_from_control(&this.control_state);
 
                             // Play chord when it changes
                             if this.tonnetz_state.current_chord_idx
@@ -648,9 +748,38 @@ impl MindDaw {
                                 this.prev_tonnetz_chord_idx =
                                     this.tonnetz_state.current_chord_idx;
                                 this.play_tonnetz_chord();
+
+                                // Log chord change
+                                if let Some(ref mut log) = this.session_log {
+                                    if let Some(chord) = this.tonnetz_state.current_chord() {
+                                        let midi = tonnetz::chord_to_midi_notes(chord);
+                                        log.log_chord(&chord.short_label(), &midi);
+                                    }
+                                }
+                            }
+
+                            // Throttled session logging (every 10 frames ≈ 3 Hz)
+                            this.log_frame_counter += 1;
+                            if this.log_frame_counter % 10 == 0 {
+                                if let Some(ref mut log) = this.session_log {
+                                    log.log_features(&bands);
+                                    log.log_control(&this.control_state);
+                                    log.log_position(this.tonnetz_state.position);
+                                }
                             }
 
                             cx.notify();
+                        }
+
+                        // Feed calibration from raw Cognionics ring buffers
+                        // (not the outlier-clipped waveform data).
+                        this.calibration_state.feed_raw_bufs(
+                            &this.cog_buffer, 0.033,
+                        );
+
+                        // Handle control events
+                        if this.control_state.take_reset() {
+                            this.tonnetz_state.reset_to_home();
                         }
 
                         true
@@ -754,10 +883,11 @@ impl Render for MindDaw {
                                                     .text_sm()
                                                     .text_color(cx.theme().muted_foreground)
                                                     .child(format!(
-                                                        "Type: {} | Channels: {} | Rate: {:.0} Hz",
+                                                        "Type: {} | Channels: {} | Rate: {:.0} Hz | ID: {}",
                                                         stream.stream_type,
                                                         stream.channel_count,
                                                         stream.sample_rate,
+                                                        stream.source_id,
                                                     )),
                                             ),
                                     )
@@ -1042,8 +1172,20 @@ impl MindDaw {
                             cx.notify();
                         }))
                 };
+                let calib_btn = if active_tab == Tab::Calibration {
+                    Button::new("tab-calib").label("Calibrate").primary()
+                } else {
+                    Button::new("tab-calib")
+                        .label("Calibrate")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.active_tab = Tab::Calibration;
+                            cx.notify();
+                        }))
+                };
 
-                let content: Div = if active_tab == Tab::Tonnetz {
+                let content: Div = if active_tab == Tab::Calibration {
+                    self.render_calibration_view(cx)
+                } else if active_tab == Tab::Tonnetz {
                     self.render_tonnetz_view(cx)
                 } else if active_tab == Tab::Soundboard {
                     self.render_soundboard_view(cx)
@@ -1073,7 +1215,7 @@ impl MindDaw {
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child(format!("Ch{ch}")),
                                         )
-                                        .child(waveform_canvas(data, 300.0))
+                                        .child(waveform_canvas(data, cognionics::SAMPLE_RATE as f32))
                                         .into_any_element()
                                 })
                                 .collect::<Vec<_>>(),
@@ -1119,6 +1261,7 @@ impl MindDaw {
                                 .child(words_btn)
                                 .child(soundboard_btn)
                                 .child(tonnetz_btn)
+                                .child(calib_btn)
                                 .child(audio_btn)
                                 .child(
                                     Button::new("cog-disconnect")
@@ -1520,10 +1663,8 @@ fn compute_spectrum(data: &[f32], fft_size: usize) -> Vec<f32> {
     // then subtract the minimum so the quietest bin sits at zero.
     let spec: Vec<f32> = buf[1..fft_size / 2]
         .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let mag = c.norm() / fft_size as f32;
-            mag  as f32
+        .map(|c| {
+            c.norm() / fft_size as f32
         })
         .collect();
     spec
@@ -2638,6 +2779,504 @@ impl MindDaw {
             .child(nav_row)
             .child(orbifold_canvas)
             .child(vl_section)
+    }
+
+    // ── Calibration ─────────────────────────────────────────────────────────
+
+    fn render_calibration_view(&mut self, cx: &mut Context<Self>) -> Div {
+        let step = self.calibration_state.step;
+        let progress = self.calibration_state.progress();
+        let has_profile = self.calibration_state.profile.is_some();
+        let profile_name = self.calibration_state.profile.as_ref()
+            .map(|p| p.user_name.clone())
+            .unwrap_or_default();
+
+        // Control state display
+        let ctl = &self.control_state;
+        let conf_c = ctl.confidence_continuous;
+        let conf_d = ctl.confidence_discrete;
+        let motion_x = ctl.motion_x;
+        let motion_y = ctl.motion_y;
+        let tension = ctl.tension;
+        let stability = ctl.stability;
+        let freeze = ctl.freeze;
+
+        // Channel quality
+        let diag = &self.calibration_state.channel_diag;
+        let good_count = self.calibration_state.good_channel_count();
+        let n_channels = diag.len();
+        let warnings = self.calibration_state.warnings.clone();
+
+        // Available profiles
+        let profiles = self.calibration_state.available_profiles.clone();
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .flex_1();
+
+        // ── Header ───────────────────────────────────────────────────────
+        col = col.child(
+            div()
+                .text_lg()
+                .font_weight(FontWeight::BOLD)
+                .text_color(cx.theme().foreground)
+                .child("EEG Calibration & Control"),
+        );
+
+        // ── Step status ──────────────────────────────────────────────────
+        col = col.child(
+            div()
+                .flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("Step: {}", step.label())),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(step.instruction()),
+                ),
+        );
+
+        // ── Progress bar ─────────────────────────────────────────────────
+        if step != calibration::CalibrationStep::Idle
+            && step != calibration::CalibrationStep::Complete
+        {
+            let bar_width = 300.0;
+            col = col.child(
+                div()
+                    .w(px(bar_width))
+                    .h(px(8.0))
+                    .rounded(px(4.0))
+                    .bg(cx.theme().muted)
+                    .child(
+                        div()
+                            .h_full()
+                            .rounded(px(4.0))
+                            .bg(cx.theme().accent)
+                            .w(px(bar_width * progress)),
+                    ),
+            );
+        }
+
+        // ── Action buttons ───────────────────────────────────────────────
+        let mut btn_row = div().flex().gap_2();
+
+        if step == calibration::CalibrationStep::Idle {
+            btn_row = btn_row.child(
+                Button::new("calib-start")
+                    .label("Full Calibration")
+                    .primary()
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.calibration_state.start();
+                        let name = if this.calibration_state.user_name.is_empty() {
+                            "default"
+                        } else {
+                            &this.calibration_state.user_name
+                        };
+                        this.session_log = Some(session_log::SessionLog::new(name));
+                        cx.notify();
+                    })),
+            );
+            // Quick refresh for returning users with an existing profile
+            if has_profile {
+                btn_row = btn_row.child(
+                    Button::new("calib-refresh")
+                        .label("Quick Refresh")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.calibration_state.start_refresh();
+                            let name = if this.calibration_state.user_name.is_empty() {
+                                "default"
+                            } else {
+                                &this.calibration_state.user_name
+                            };
+                            this.session_log = Some(session_log::SessionLog::new(name));
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+
+        if step == calibration::CalibrationStep::Complete || has_profile {
+            btn_row = btn_row.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().accent)
+                    .child(format!("Profile: {}", profile_name)),
+            );
+        }
+
+        col = col.child(btn_row);
+
+        // ── Load existing profiles ───────────────────────────────────────
+        if !profiles.is_empty() && step == calibration::CalibrationStep::Idle {
+            let mut profile_row = div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Load profile:"),
+                );
+
+            for name in profiles {
+                let name_clone = name.clone();
+                profile_row = profile_row.child(
+                    Button::new(SharedString::from(format!("load-{}", &name)))
+                        .label(SharedString::from(name))
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.calibration_state.load_profile(&name_clone);
+                            // Start session logging with loaded profile
+                            this.session_log = Some(session_log::SessionLog::new(&name_clone));
+                            if let Some(ref mut log) = this.session_log {
+                                log.log_calibration(&name_clone);
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            col = col.child(profile_row);
+        }
+
+        // ── Channel quality display ───────────────────────────────────────
+        col = col.child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().foreground)
+                .child(format!("Channels: {}/{} usable", good_count, n_channels)),
+        );
+
+        // Per-channel quality indicators (green/yellow/red dots as text)
+        {
+            let mut ch_row = String::new();
+            for (i, d) in self.calibration_state.channel_diag.iter().enumerate() {
+                if i > 0 && i % 16 == 0 { ch_row.push('\n'); }
+                let symbol = if d.flat {
+                    '_'  // flat/disconnected
+                } else if d.quality > 0.6 {
+                    'G'  // green / good
+                } else if d.quality > 0.3 {
+                    'Y'  // yellow / marginal
+                } else {
+                    'R'  // red / bad
+                };
+                ch_row.push(symbol);
+                ch_row.push(' ');
+            }
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(ch_row),
+            );
+        }
+
+        // Warnings
+        for w in &warnings {
+            col = col.child(
+                div()
+                    .text_sm()
+                    .text_color(gpui_component::yellow_500())
+                    .child(w.clone()),
+            );
+        }
+
+        // ── Live Control State display ───────────────────────────────────
+        col = col.child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().foreground)
+                .mt_2()
+                .child("Live Control State"),
+        );
+
+        let control_info = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(format!(
+                "Motion:     ({:+.2}, {:+.2})", motion_x, motion_y
+            ))
+            .child(format!("Tension:    {:.2}", tension))
+            .child(format!("Stability:  {:.2}", stability))
+            .child(format!("Confidence: c={:.2} d={:.2}", conf_c, conf_d))
+            .child(format!("Freeze:     {}", if freeze { "ON" } else { "off" }));
+
+        col = col.child(control_info);
+
+        // ── Motion + confidence visualization (canvas) ───────────────────
+        let mx = motion_x;
+        let my = motion_y;
+        let cc = conf_c;
+        let tn = tension;
+        let st = stability;
+        let motion_canvas = canvas(
+            move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                bounds // pass bounds through to paint
+            },
+            move |_actual_bounds: Bounds<Pixels>,
+                  bounds: Bounds<Pixels>,
+                  window: &mut Window,
+                  _cx: &mut App| {
+                // Background
+                window.paint_quad(gpui::fill(bounds, gpui::hsla(0.0, 0.0, 0.06, 1.0)));
+                window.paint_quad(gpui::outline(
+                    bounds, gpui::hsla(0.0, 0.0, 0.2, 1.0), gpui::BorderStyle::Solid,
+                ));
+
+                let w: f32 = bounds.size.width.into();
+                let h: f32 = bounds.size.height.into();
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+                let cx_f = ox + w * 0.5;
+                let cy_f = oy + h * 0.5;
+                let radius = w.min(h) * 0.4;
+
+                // Crosshairs
+                let cross_color = gpui::hsla(0.0, 0.0, 0.3, 0.5);
+                window.paint_quad(gpui::fill(
+                    Bounds::new(
+                        point(px(cx_f - 0.5), px(oy)),
+                        size(px(1.0), px(h)),
+                    ),
+                    cross_color,
+                ));
+                window.paint_quad(gpui::fill(
+                    Bounds::new(
+                        point(px(ox), px(cy_f - 0.5)),
+                        size(px(w), px(1.0)),
+                    ),
+                    cross_color,
+                ));
+
+                // Cursor dot — size and color reflect confidence
+                let dot_x = cx_f + mx * radius;
+                let dot_y = cy_f - my * radius;
+                let dot_r = 3.0 + cc * 7.0;
+                let dot_hue = if cc > 0.6 { 0.33 } else if cc > 0.3 { 0.15 } else { 0.0 };
+                let dot_color = gpui::hsla(dot_hue, 0.8, 0.55, 1.0);
+                window.paint_quad(gpui::fill(
+                    Bounds::new(
+                        point(px(dot_x - dot_r), px(dot_y - dot_r)),
+                        size(px(dot_r * 2.0), px(dot_r * 2.0)),
+                    ),
+                    dot_color,
+                ));
+
+                // Tension bar (bottom)
+                let bar_h = 4.0;
+                let bar_y = oy + h - bar_h - 2.0;
+                window.paint_quad(gpui::fill(
+                    Bounds::new(
+                        point(px(ox + 2.0), px(bar_y)),
+                        size(px((w - 4.0) * tn), px(bar_h)),
+                    ),
+                    gpui::hsla(0.0, 0.7, 0.5, 0.8),
+                ));
+
+                // Stability bar (right side, vertical)
+                let sbar_w = 4.0;
+                let sbar_x = ox + w - sbar_w - 2.0;
+                let sbar_h = (h - 4.0) * st;
+                window.paint_quad(gpui::fill(
+                    Bounds::new(
+                        point(px(sbar_x), px(oy + h - 2.0 - sbar_h)),
+                        size(px(sbar_w), px(sbar_h)),
+                    ),
+                    gpui::hsla(0.58, 0.7, 0.5, 0.8),
+                ));
+            },
+        )
+        .w(px(160.0))
+        .h(px(160.0));
+
+        col = col.child(
+            div()
+                .flex()
+                .gap_4()
+                .child(motion_canvas)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("X: relaxation (alpha/beta)")
+                        .child("Y: arousal (theta)")
+                        .child("Bottom bar: tension")
+                        .child("Right bar: stability")
+                        .child(format!("Dot size = confidence ({:.0}%)", conf_c * 100.0)),
+                ),
+        );
+
+        // ── Live Detection ────────────────────────────────────────────────
+        col = col.child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().foreground)
+                .mt_2()
+                .child("Live Detection"),
+        );
+
+        // Active detections (blink / jaw clench indicators)
+        {
+            let blink_color = if self.detecting_blink {
+                gpui::hsla(0.33, 0.9, 0.5, 1.0) // green when active
+            } else {
+                gpui::hsla(0.0, 0.0, 0.3, 1.0) // dim when inactive
+            };
+            let jaw_color = if self.detecting_jaw_clench {
+                gpui::hsla(0.08, 0.9, 0.55, 1.0) // orange when active
+            } else {
+                gpui::hsla(0.0, 0.0, 0.3, 1.0)
+            };
+
+            col = col.child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .rounded(px(5.0))
+                                    .bg(blink_color),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Blink"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .rounded(px(5.0))
+                                    .bg(jaw_color),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Jaw Clench"),
+                            ),
+                    ),
+            );
+        }
+
+        // Band power bars
+        {
+            let bands = &self.live_band_powers;
+            let band_data: [(&str, f32, f32); 5] = [
+                ("δ delta",  bands.delta,  0.58),  // blue
+                ("θ theta",  bands.theta,  0.75),  // purple
+                ("α alpha",  bands.alpha,  0.33),  // green
+                ("β beta",   bands.beta,   0.15),  // yellow
+                ("γ gamma",  bands.gamma,  0.0),   // red
+            ];
+
+            let mut bands_col = div().flex().flex_col().gap_1();
+            for (label, power, hue) in band_data {
+                let bar_frac = power.clamp(0.0, 1.0);
+                let bar_color = gpui::hsla(hue, 0.7, 0.5, 0.9);
+                bands_col = bands_col.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .w(px(60.0))
+                                .child(label.to_string()),
+                        )
+                        .child(
+                            div()
+                                .w(px(150.0))
+                                .h(px(8.0))
+                                .rounded(px(4.0))
+                                .bg(cx.theme().muted)
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded(px(4.0))
+                                        .bg(bar_color)
+                                        .w(px(150.0 * bar_frac)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{:.2}", power)),
+                        ),
+                );
+            }
+            col = col.child(bands_col);
+        }
+
+        // Recent detected events log
+        {
+            let mut events_col = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .mt_1();
+
+            let now = std::time::Instant::now();
+            for (t, name) in self.detected_events.iter().rev().take(8) {
+                let ago = now.duration_since(*t).as_secs_f32();
+                let alpha = (1.0 - ago / 5.0).clamp(0.1, 1.0);
+                events_col = events_col.child(
+                    div()
+                        .text_xs()
+                        .text_color(gpui::hsla(0.0, 0.0, 0.7, alpha))
+                        .child(format!("{} ({:.1}s ago)", name, ago)),
+                );
+            }
+
+            if self.detected_events.is_empty() {
+                events_col = events_col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No events detected yet — try blinking or clenching jaw"),
+                );
+            }
+
+            col = col.child(events_col);
+        }
+
+        col
     }
 
     // ── Soundboard ────────────────────────────────────────────────────────────

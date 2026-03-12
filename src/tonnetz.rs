@@ -577,6 +577,69 @@ impl TonnetzState {
         for i in 0..3 {
             self.position[i] += self.nav_velocity[i] * speed;
         }
+        self.clamp_and_snap();
+    }
+
+    /// Update from a ControlState (the calibrated decoder output).
+    ///
+    /// Confidence modulates speed and smoothing:
+    ///  - High confidence → faster, more responsive movement
+    ///  - Low confidence → slower, more damped, biased toward staying put
+    ///
+    /// Tension biases toward more dissonant chords (diminished, augmented).
+    /// Stability controls the snap strength toward chord attractors.
+    pub fn update_from_control(&mut self, ctl: &crate::control::ControlState) {
+        if ctl.freeze {
+            // Still record trail position for visualization
+            if self.position_trail.len() >= TRAIL_LEN {
+                self.position_trail.pop_front();
+            }
+            self.position_trail.push_back(self.position);
+            return;
+        }
+
+        // Confidence-weighted speed: [0.02, 0.2]
+        let confidence = ctl.overall_confidence();
+        let speed = 0.02 + 0.18 * confidence;
+
+        // Confidence-weighted smoothing: high confidence → less smoothing (0.7),
+        // low confidence → heavy smoothing (0.97)
+        let smoothing = 0.97 - 0.27 * confidence;
+
+        // Apply motion with smoothing
+        let signal = [ctl.motion_x, ctl.motion_y, 0.0];
+        for i in 0..3 {
+            self.nav_velocity[i] =
+                smoothing * self.nav_velocity[i] + (1.0 - smoothing) * signal[i];
+        }
+        for i in 0..3 {
+            self.position[i] += self.nav_velocity[i] * speed;
+        }
+
+        // Stability-based attractor snap: when stability is high, gently pull
+        // toward the nearest chord node to keep harmony coherent.
+        if ctl.stability > 0.3 && !self.nodes.is_empty() {
+            let snap_strength = (ctl.stability - 0.3) * 0.05; // 0..0.035
+            let node = &self.nodes[self.current_chord_idx];
+            let period = self.orbifold.domain_period();
+            let raw_dx = (node.ox - self.position[0]).rem_euclid(period);
+            let dx = if raw_dx > period / 2.0 { raw_dx - period } else { raw_dx };
+            let dy = node.oy - self.position[1];
+            self.position[0] += dx * snap_strength;
+            self.position[1] += dy * snap_strength;
+        }
+
+        self.clamp_and_snap();
+    }
+
+    /// Handle a reset event: return to the center of the fundamental domain.
+    pub fn reset_to_home(&mut self) {
+        let period = self.orbifold.domain_period();
+        self.position = [period / 2.0, 0.0, 0.0];
+        self.nav_velocity = [0.0; 3];
+    }
+
+    fn clamp_and_snap(&mut self) {
         // Wrap/clamp to fundamental domain
         let period = self.orbifold.domain_period();
         self.position[0] = self.position[0].rem_euclid(period);

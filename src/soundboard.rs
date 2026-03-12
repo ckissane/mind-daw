@@ -88,6 +88,12 @@ pub struct SoundboardHandle {
     pub cmd_tx: mpsc::SyncSender<SbCommand>,
 }
 
+impl Drop for SoundboardHandle {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.try_send(SbCommand::Stop);
+    }
+}
+
 // ── Internal voice (pre-rendered samples) ────────────────────────────────────
 
 struct Voice {

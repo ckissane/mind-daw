@@ -7,7 +7,6 @@ pub const SAMPLE_RATE: f64 = 300.0;
 pub const PACKET_SIZE: usize = 195;
 const SYNC_BYTE: u8 = 0xFF;
 const IMPEDANCE_OFF_CMD: u8 = 0x12;
-const VALID_STATUS: u8 = 0x11;
 
 /// Microvolts conversion factor: 1e6 / 2^32
 const UV_SCALE: f64 = 1e6 / 4_294_967_296.0;
@@ -45,6 +44,12 @@ pub struct CogHandle {
     pub cmd_tx: mpsc::Sender<CogCommand>,
     pub sample_rx: mpsc::Receiver<CogSample>,
     pub state_rx: mpsc::Receiver<CogState>,
+}
+
+impl Drop for CogHandle {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(CogCommand::Shutdown);
+    }
 }
 
 // ── Packet parser ────────────────────────────────────────────────────────────
@@ -552,6 +557,8 @@ fn connect_and_stream_macos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_STATUS: u8 = 0x11;
 
     #[test]
     fn parse_valid_packet() {
