@@ -547,6 +547,70 @@ fn connect_and_stream_macos(
     Ok(())
 }
 
+// ── Demo worker ──────────────────────────────────────────────────────────────
+
+/// Spawn a synthetic-data demo worker that immediately enters Streaming state.
+/// Generates EEG-like sine waves across all 64 channels without real hardware.
+pub fn spawn_demo_worker() -> CogHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CogCommand>();
+    let (sample_tx, sample_rx) = mpsc::sync_channel::<CogSample>(1024);
+    let (state_tx, state_rx) = mpsc::channel::<CogState>();
+
+    std::thread::Builder::new()
+        .name("cog-demo".into())
+        .spawn(move || {
+            demo_worker_loop(cmd_rx, sample_tx, state_tx);
+        })
+        .expect("failed to spawn demo worker thread");
+
+    CogHandle {
+        cmd_tx,
+        sample_rx,
+        state_rx,
+    }
+}
+
+fn demo_worker_loop(
+    cmd_rx: mpsc::Receiver<CogCommand>,
+    sample_tx: mpsc::SyncSender<CogSample>,
+    state_tx: mpsc::Sender<CogState>,
+) {
+    let _ = state_tx.send(CogState::Streaming);
+
+    // Representative brain-wave frequencies across delta/theta/alpha/beta/gamma bands
+    const BASE_FREQS: [f64; 8] = [1.5, 3.0, 6.0, 8.0, 10.0, 20.0, 35.0, 50.0];
+    let mut phase = [0.0f64; NUM_CHANNELS];
+    let mut counter: u8 = 0;
+    let period = std::time::Duration::from_nanos(1_000_000_000 / 300);
+
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(CogCommand::Disconnect) | Ok(CogCommand::Shutdown) => {
+                let _ = state_tx.send(CogState::Disconnected);
+                break;
+            }
+            _ => {}
+        }
+
+        let mut channels = [0.0f32; NUM_CHANNELS];
+        for ch in 0..NUM_CHANNELS {
+            let freq = BASE_FREQS[ch % BASE_FREQS.len()]
+                * (1.0 + (ch / BASE_FREQS.len()) as f64 * 0.25);
+            phase[ch] += 2.0 * std::f64::consts::PI * freq / 300.0;
+            let offset = ((ch as f64 * 1.3 + counter as f64 * 0.02).sin()) * 8.0;
+            channels[ch] = ((phase[ch].sin() * 45.0) + offset) as f32;
+        }
+
+        let _ = sample_tx.try_send(CogSample {
+            counter,
+            channels,
+            status: VALID_STATUS,
+        });
+        counter = counter.wrapping_add(1);
+        std::thread::sleep(period);
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
