@@ -2,6 +2,8 @@ mod audio;
 mod cognionics;
 mod soundboard;
 mod streams;
+#[allow(dead_code)]
+mod tonnetz;
 mod word_read;
 
 use audio::{AudioCommand, AudioHandle, EegFrame};
@@ -21,6 +23,7 @@ enum Tab {
     Pca,
     Words,
     Soundboard,
+    Tonnetz,
 }
 
 struct SoundboardUiState {
@@ -149,6 +152,11 @@ struct MindDaw {
     // Soundboard
     soundboard_handle: Option<soundboard::SoundboardHandle>,
     sb: SoundboardUiState,
+
+    // Tonnetz / Orbifold
+    tonnetz_state: tonnetz::TonnetzState,
+    prev_tonnetz_chord_idx: usize,
+    tonnetz_muted: bool,
 }
 
 const COG_BUFFER_CAPACITY: usize = 150;
@@ -370,6 +378,10 @@ impl MindDaw {
 
             soundboard_handle: None,
             sb: SoundboardUiState::default(),
+
+            tonnetz_state: tonnetz::TonnetzState::new(tonnetz::OrbifoldType::Dyads),
+            prev_tonnetz_chord_idx: 0,
+            tonnetz_muted: true,
         }
     }
 
@@ -413,7 +425,11 @@ impl MindDaw {
                                         (0..ch).map(|c| paired.channel_data(c)).collect();
 
                                     // Send audio frame (build inline to avoid borrow conflict)
-                                    if this.audio_enabled {
+                                    // Disable EEG sonification on the Tonnetz tab (it
+                                    // produces static noise that drowns out chord audio).
+                                    if this.audio_enabled
+                                        && this.active_tab != Tab::Tonnetz
+                                    {
                                         if let Some(ref handle) = this.audio_handle {
                                             let frame = EegFrame {
                                                 channels: (0..ch)
@@ -620,6 +636,19 @@ impl MindDaw {
 
                             // Word reading update
                             this.word_read_state.tick(&features);
+
+                            // Tonnetz navigation from brain waves
+                            let nav = tonnetz::eeg_to_nav_signal(&features);
+                            this.tonnetz_state.update_from_brain(nav);
+
+                            // Play chord when it changes
+                            if this.tonnetz_state.current_chord_idx
+                                != this.prev_tonnetz_chord_idx
+                            {
+                                this.prev_tonnetz_chord_idx =
+                                    this.tonnetz_state.current_chord_idx;
+                                this.play_tonnetz_chord();
+                            }
 
                             cx.notify();
                         }
@@ -1003,8 +1032,20 @@ impl MindDaw {
                             cx.notify();
                         }))
                 };
+                let tonnetz_btn = if active_tab == Tab::Tonnetz {
+                    Button::new("tab-tonnetz").label("Tonnetz").primary()
+                } else {
+                    Button::new("tab-tonnetz")
+                        .label("Tonnetz")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.active_tab = Tab::Tonnetz;
+                            cx.notify();
+                        }))
+                };
 
-                let content: Div = if active_tab == Tab::Soundboard {
+                let content: Div = if active_tab == Tab::Tonnetz {
+                    self.render_tonnetz_view(cx)
+                } else if active_tab == Tab::Soundboard {
                     self.render_soundboard_view(cx)
                 } else if active_tab == Tab::Words {
                     self.render_word_read_view(cx)
@@ -1077,6 +1118,7 @@ impl MindDaw {
                                 .child(pca_btn)
                                 .child(words_btn)
                                 .child(soundboard_btn)
+                                .child(tonnetz_btn)
                                 .child(audio_btn)
                                 .child(
                                     Button::new("cog-disconnect")
@@ -1898,6 +1940,704 @@ impl MindDaw {
             .gap_4()
             .child(training_area)
             .child(prediction_bar)
+    }
+
+    // ── Tonnetz / Orbifold ──────────────────────────────────────────────────
+
+    fn play_tonnetz_chord(&mut self) {
+        if self.tonnetz_muted {
+            return;
+        }
+        self.sb_ensure_engine();
+        if let Some(chord) = self.tonnetz_state.current_chord() {
+            let midi_notes = tonnetz::chord_to_midi_notes(chord);
+            if let Some(ref h) = self.soundboard_handle {
+                for &midi in &midi_notes {
+                    let _ = h.cmd_tx.try_send(soundboard::SbCommand::PlayNote {
+                        midi,
+                        waveform: soundboard::SbWaveform::Sine,
+                        instrument: soundboard::SbInstrument::Piano,
+                        chord: soundboard::SbChord::Single,
+                        volume: 0.3 / midi_notes.len() as f32,
+                    });
+                }
+            }
+        }
+    }
+
+    fn render_tonnetz_view(&mut self, cx: &mut Context<Self>) -> Div {
+        let state = &self.tonnetz_state;
+        let orbifold = state.orbifold;
+        let current_idx = state.current_chord_idx;
+        let current_chord_label = state
+            .current_chord()
+            .map(|c| format!("{} ({})", c.label(), c.type_label()))
+            .unwrap_or_default();
+        let trail_len = state.chord_trail.len();
+        let nav_vel = state.nav_velocity;
+
+        // ── Orbifold selector ────────────────────────────────────────────────
+        let orbifold_types = [
+            tonnetz::OrbifoldType::Dyads,
+            tonnetz::OrbifoldType::Triads,
+        ];
+        let mut orb_row = div().flex().gap_1();
+        for orb in orbifold_types {
+            let btn = if orbifold == orb {
+                Button::new(SharedString::from(format!("orb-{:?}", orb)))
+                    .label(orb.label())
+                    .primary()
+            } else {
+                Button::new(SharedString::from(format!("orb-{:?}", orb)))
+                    .label(orb.label())
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.tonnetz_state.set_orbifold(orb);
+                        cx.notify();
+                    }))
+            };
+            orb_row = orb_row.child(btn);
+        }
+
+        // ── Mute toggle ────────────────────────────────────────────────────
+        let mute_btn = if self.tonnetz_muted {
+            Button::new("orb-mute")
+                .label("Unmute")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.tonnetz_muted = false;
+                    this.play_tonnetz_chord();
+                    cx.notify();
+                }))
+        } else {
+            Button::new("orb-mute")
+                .label("Mute")
+                .danger()
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.tonnetz_muted = true;
+                    cx.notify();
+                }))
+        };
+
+        let orb_label = match orbifold {
+            tonnetz::OrbifoldType::Dyads => "T\u{00B2}/S\u{2082}",
+            tonnetz::OrbifoldType::Triads => "T\u{00B3}/S\u{2083}",
+            tonnetz::OrbifoldType::Tetrads => "T\u{2074}/S\u{2084}",
+        };
+
+        // ── Status bar ──────────────────────────────────────────────────────
+        let status = div()
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(gpui::hsla(0.58, 0.8, 0.7, 1.0))
+                    .child(SharedString::from(format!(
+                        "{}  \u{2014}  {}",
+                        orb_label, current_chord_label
+                    ))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "trail: {} | nav: [{:.2}, {:.2}]",
+                        trail_len, nav_vel[0], nav_vel[1]
+                    )),
+            );
+
+        // ── Canvas data ─────────────────────────────────────────────────────
+
+        // Node data: (ox, oy, oz, hue_idx, is_current)
+        let node_data: Vec<(f32, f32, f32, u8, bool)> = state
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.ox, n.oy, n.oz, n.chord.hue_index(), i == current_idx))
+            .collect();
+
+        let edges: Vec<(usize, usize, f32)> = state
+            .edges
+            .iter()
+            .map(|e| (e.from, e.to, e.distance))
+            .collect();
+
+        let trail: Vec<usize> = state.chord_trail.iter().copied().collect();
+        let is_dyads = orbifold == tonnetz::OrbifoldType::Dyads;
+        let yaw = state.yaw;
+        let pitch_angle = state.pitch;
+        let zoom = state.zoom;
+
+        let orbifold_canvas = canvas(
+            move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| bounds,
+            move |_bounds: Bounds<Pixels>,
+                  bounds: Bounds<Pixels>,
+                  window: &mut Window,
+                  _cx: &mut App| {
+                let w: f32 = bounds.size.width.into();
+                let h: f32 = bounds.size.height.into();
+                let bx: f32 = bounds.origin.x.into();
+                let by: f32 = bounds.origin.y.into();
+
+                window.paint_quad(gpui::fill(bounds, gpui::hsla(0.0, 0.0, 0.06, 1.0)));
+
+                let hues: [f32; 6] = [0.58, 0.75, 0.0, 0.15, 0.45, 0.5];
+                let margin = 50.0f32;
+
+                if is_dyads {
+                    // ── T²/S₂: Möbius strip [0,6]×[0,12] as square ──────
+                    let side = (w - 2.0 * margin).min(h - 2.0 * margin);
+                    let cx0 = bx + w / 2.0;
+                    let cy0 = by + h / 2.0;
+                    let left = cx0 - side / 2.0;
+                    let top = cy0 - side / 2.0;
+
+                    let to_screen = |ox: f32, oy: f32| -> (f32, f32) {
+                        let sx = left + (ox / 6.0) * side;
+                        let sy = top + side - (oy / 12.0) * side;
+                        (sx, sy)
+                    };
+
+                    let domain = Bounds {
+                        origin: point(px(left), px(top)),
+                        size: size(px(side), px(side)),
+                    };
+                    window.paint_quad(gpui::fill(domain, gpui::hsla(0.6, 0.12, 0.09, 1.0)));
+                    window.paint_quad(gpui::outline(
+                        domain,
+                        gpui::hsla(0.6, 0.4, 0.4, 0.6),
+                        gpui::BorderStyle::Solid,
+                    ));
+
+                    // Grid lines
+                    for iv in 0..=12 {
+                        let (_, sy) = to_screen(0.0, iv as f32);
+                        let alpha = if iv == 0 || iv == 6 || iv == 12 { 0.5 } else { 0.15 };
+                        let stroke = if iv == 0 || iv == 6 || iv == 12 { 1.0 } else { 0.5 };
+                        let mut gb = PathBuilder::stroke(px(stroke));
+                        gb.move_to(point(px(left), px(sy)));
+                        gb.line_to(point(px(left + side), px(sy)));
+                        if let Ok(path) = gb.build() {
+                            window.paint_path(path, gpui::hsla(0.0, 0.0, 0.3, alpha));
+                        }
+                        let mut tb = PathBuilder::stroke(px(1.0));
+                        tb.move_to(point(px(left - 4.0), px(sy)));
+                        tb.line_to(point(px(left), px(sy)));
+                        if let Ok(path) = tb.build() {
+                            window.paint_path(path, gpui::hsla(0.0, 0.0, 0.4, 0.8));
+                        }
+                    }
+                    for t in 0..=6 {
+                        let (sx, _) = to_screen(t as f32, 0.0);
+                        let mut gb = PathBuilder::stroke(px(0.5));
+                        gb.move_to(point(px(sx), px(top)));
+                        gb.line_to(point(px(sx), px(top + side)));
+                        if let Ok(path) = gb.build() {
+                            window.paint_path(path, gpui::hsla(0.0, 0.0, 0.3, 0.15));
+                        }
+                    }
+
+                    // Möbius gluing arrows
+                    for i in 0..6 {
+                        let frac = (i as f32 + 0.5) / 6.0;
+                        let (_, sy) = to_screen(0.0, frac * 12.0);
+                        let ax = left - 1.0;
+                        let mut b = PathBuilder::stroke(px(2.0));
+                        b.move_to(point(px(ax), px(sy + 8.0)));
+                        b.line_to(point(px(ax), px(sy - 8.0)));
+                        b.move_to(point(px(ax - 3.0), px(sy - 5.0)));
+                        b.line_to(point(px(ax), px(sy - 8.0)));
+                        b.line_to(point(px(ax + 3.0), px(sy - 5.0)));
+                        if let Ok(path) = b.build() {
+                            window.paint_path(path, gpui::hsla(0.08, 0.9, 0.6, 0.6));
+                        }
+                        let ax_r = left + side + 1.0;
+                        let mut b2 = PathBuilder::stroke(px(2.0));
+                        b2.move_to(point(px(ax_r), px(sy - 8.0)));
+                        b2.line_to(point(px(ax_r), px(sy + 8.0)));
+                        b2.move_to(point(px(ax_r - 3.0), px(sy + 5.0)));
+                        b2.line_to(point(px(ax_r), px(sy + 8.0)));
+                        b2.line_to(point(px(ax_r + 3.0), px(sy + 5.0)));
+                        if let Ok(path) = b2.build() {
+                            window.paint_path(path, gpui::hsla(0.08, 0.9, 0.6, 0.6));
+                        }
+                    }
+
+                    // Edges, trail, nodes (2D)
+                    for &(from, to, dist) in &edges {
+                        if let (Some(&(ox1, oy1, _, _, c1)), Some(&(ox2, oy2, _, _, c2))) =
+                            (node_data.get(from), node_data.get(to))
+                        {
+                            let (x1, y1) = to_screen(ox1, oy1);
+                            let (x2, y2) = to_screen(ox2, oy2);
+                            let alpha = if c1 || c2 { 0.5 } else {
+                                (0.08 + 0.15 * (1.0 - dist / 3.0).max(0.0)).min(0.25)
+                            };
+                            let hue = if c1 || c2 { 0.33 } else { 0.58 };
+                            let mut builder = PathBuilder::stroke(px(if c1 || c2 { 1.5 } else { 0.5 }));
+                            builder.move_to(point(px(x1), px(y1)));
+                            builder.line_to(point(px(x2), px(y2)));
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, gpui::hsla(hue, 0.5, 0.5, alpha));
+                            }
+                        }
+                    }
+                    for pair in trail.windows(2) {
+                        if let (Some(&(ox1, oy1, _, _, _)), Some(&(ox2, oy2, _, _, _))) =
+                            (node_data.get(pair[0]), node_data.get(pair[1]))
+                        {
+                            let (x1, y1) = to_screen(ox1, oy1);
+                            let (x2, y2) = to_screen(ox2, oy2);
+                            let mut builder = PathBuilder::stroke(px(1.5));
+                            builder.move_to(point(px(x1), px(y1)));
+                            builder.line_to(point(px(x2), px(y2)));
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, gpui::hsla(0.08, 0.9, 0.6, 0.5));
+                            }
+                        }
+                    }
+                    for &(ox, oy, _, hue_idx, is_current) in &node_data {
+                        let (x, y) = to_screen(ox, oy);
+                        let sz = if is_current { 16.0 } else { 8.0 };
+                        let nb = Bounds {
+                            origin: point(px(x - sz / 2.0), px(y - sz / 2.0)),
+                            size: size(px(sz), px(sz)),
+                        };
+                        if is_current {
+                            let gs = 26.0;
+                            let glow = Bounds {
+                                origin: point(px(x - gs / 2.0), px(y - gs / 2.0)),
+                                size: size(px(gs), px(gs)),
+                            };
+                            window.paint_quad(gpui::fill(glow, gpui::hsla(0.33, 0.9, 0.6, 0.25)));
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(0.33, 0.9, 0.7, 1.0)));
+                        } else {
+                            let hue = hues[hue_idx as usize % hues.len()];
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(hue, 0.6, 0.5, 0.7)));
+                        }
+                    }
+                } else {
+                    // ── T³/S₃: 3D triangular prism gluing diagram ────────
+                    // The fundamental domain is a triangular prism:
+                    //   - Transposition axis (length, period 4) along one direction
+                    //   - Triangular cross-section from the interval simplex
+                    // The two triangular end-faces are identified with a 120°
+                    // rotation (cyclic permutation of voices).
+
+                    // Use full 3D coords: ox = transposition [0,4),
+                    // oy = barycentric y, oz = barycentric z
+                    // Compute bounding box for normalization, padded so the
+                    // prism wireframe visually encloses all chord nodes.
+                    let (mut xmn, mut xmx) = (f32::INFINITY, f32::NEG_INFINITY);
+                    let (mut ymn, mut ymx) = (f32::INFINITY, f32::NEG_INFINITY);
+                    let (mut zmn, mut zmx) = (f32::INFINITY, f32::NEG_INFINITY);
+                    for &(ox, oy, oz, _, _) in &node_data {
+                        xmn = xmn.min(ox); xmx = xmx.max(ox);
+                        ymn = ymn.min(oy); ymx = ymx.max(oy);
+                        zmn = zmn.min(oz); zmx = zmx.max(oz);
+                    }
+                    // Pad so the prism extends well beyond the data
+                    let ypad = (ymx - ymn).max(0.01) * 0.80;
+                    let zpad = (zmx - zmn).max(0.01) * 0.80;
+                    let xpad = (xmx - xmn).max(0.01) * 0.40;
+                    xmn -= xpad; xmx += xpad;
+                    ymn -= ypad; ymx += ypad;
+                    zmn -= zpad; zmx += zpad;
+                    let xr = (xmx - xmn).max(0.01);
+                    let yr = (ymx - ymn).max(0.01);
+                    let zr = (zmx - zmn).max(0.01);
+
+                    let cx3 = bx + w / 2.0;
+                    let cy3 = by + h / 2.0;
+                    let r = (w.min(h) / 2.0 - margin) * 0.8 * zoom;
+
+                    let project = |ox: f32, oy: f32, oz: f32| -> (f32, f32, f32) {
+                        // Normalize to [-1, 1] with aspect: make transposition
+                        // axis longer than the cross-section
+                        let nx = (ox - xmn) / xr * 2.0 - 1.0;
+                        let ny = (oy - ymn) / yr * 2.0 - 1.0;
+                        let nz = (oz - zmn) / zr * 2.0 - 1.0;
+                        let rotated = rotate_x(rotate_y([nx, ny, nz], yaw), pitch_angle);
+                        (cx3 + rotated[0] * r, cy3 - rotated[1] * r, rotated[2])
+                    };
+
+                    // ── Prism wireframe (the gluing diagram) ─────────────
+                    // Two triangular faces at x=0 and x=4 (normalized to
+                    // x=-1 and x=+1). The triangle vertices are the three
+                    // "pure" interval types: (12,0,0), (0,12,0), (0,0,12)
+                    // in barycentric coords, but we use the actual data
+                    // extent for the triangle corners.
+                    // Equilateral triangle vertices in the yz-plane
+                    let tri_verts = [
+                        (0.0f32, 1.0f32),     // top
+                        (-0.866, -0.5),        // bottom-left
+                        (0.866, -0.5),         // bottom-right
+                    ];
+                    // Map triangle verts to data space
+                    let tri_3d: Vec<[(f32, f32, f32); 2]> = tri_verts.iter().map(|&(ty, tz)| {
+                        let y = ymn + (ty * 0.5 + 0.5) * yr;
+                        let z = zmn + (tz * 0.5 + 0.5) * zr;
+                        [(xmn, y, z), (xmx, y, z)]
+                    }).collect();
+
+                    // Draw the 3 longitudinal edges of the prism
+                    for edge in &tri_3d {
+                        let (x1, y1, _) = project(edge[0].0, edge[0].1, edge[0].2);
+                        let (x2, y2, _) = project(edge[1].0, edge[1].1, edge[1].2);
+                        let mut pb = PathBuilder::stroke(px(1.5));
+                        pb.move_to(point(px(x1), px(y1)));
+                        pb.line_to(point(px(x2), px(y2)));
+                        if let Ok(path) = pb.build() {
+                            window.paint_path(path, gpui::hsla(0.0, 0.0, 0.4, 0.5));
+                        }
+                    }
+
+                    // Draw the two triangular end-faces
+                    for face_x in [xmn, xmx] {
+                        let verts: Vec<(f32, f32)> = tri_verts.iter().map(|&(ty, tz)| {
+                            let y = ymn + (ty * 0.5 + 0.5) * yr;
+                            let z = zmn + (tz * 0.5 + 0.5) * zr;
+                            let (sx, sy, _) = project(face_x, y, z);
+                            (sx, sy)
+                        }).collect();
+                        for i in 0..3 {
+                            let j = (i + 1) % 3;
+                            let mut pb = PathBuilder::stroke(px(1.5));
+                            pb.move_to(point(px(verts[i].0), px(verts[i].1)));
+                            pb.line_to(point(px(verts[j].0), px(verts[j].1)));
+                            if let Ok(path) = pb.build() {
+                                let hue = if face_x == xmn { 0.55 } else { 0.55 };
+                                window.paint_path(path, gpui::hsla(hue, 0.5, 0.5, 0.6));
+                            }
+                        }
+                    }
+
+                    // ── 120° twist gluing arrows on triangular faces ─────
+                    // Three color-coded arrows on each face showing the
+                    // cyclic permutation: vertex A→B, B→C, C→A
+                    let twist_hues = [0.0f32, 0.33, 0.66]; // red, green, blue
+                    for (face_idx, face_x) in [xmn, xmx].iter().enumerate() {
+                        let verts: Vec<(f32, f32)> = tri_verts.iter().map(|&(ty, tz)| {
+                            let y = ymn + (ty * 0.5 + 0.5) * yr;
+                            let z = zmn + (tz * 0.5 + 0.5) * zr;
+                            let (sx, sy, _) = project(*face_x, y, z);
+                            (sx, sy)
+                        }).collect();
+                        // Center of triangle
+                        let tcx = (verts[0].0 + verts[1].0 + verts[2].0) / 3.0;
+                        let tcy = (verts[0].1 + verts[1].1 + verts[2].1) / 3.0;
+                        for k in 0..3 {
+                            // Arrow from midpoint of edge k toward next vertex
+                            // Direction depends on face: face 0 goes clockwise,
+                            // face 1 goes counter-clockwise (the twist)
+                            let (i, j) = if face_idx == 0 {
+                                (k, (k + 1) % 3)
+                            } else {
+                                ((k + 1) % 3, k)
+                            };
+                            // Midpoint of edge
+                            let mx = (verts[i].0 + verts[j].0) / 2.0;
+                            let my = (verts[i].1 + verts[j].1) / 2.0;
+                            // Shrink arrow toward center so it's visible
+                            let ax = mx * 0.6 + tcx * 0.4;
+                            let ay = my * 0.6 + tcy * 0.4;
+                            // Arrow direction: toward the "next" vertex
+                            let dx = verts[j].0 - verts[i].0;
+                            let dy = verts[j].1 - verts[i].1;
+                            let len = (dx * dx + dy * dy).sqrt().max(0.01);
+                            let ux = dx / len;
+                            let uy = dy / len;
+                            let arrow_len = len * 0.25;
+
+                            let mut pb = PathBuilder::stroke(px(2.5));
+                            pb.move_to(point(px(ax - ux * arrow_len), px(ay - uy * arrow_len)));
+                            pb.line_to(point(px(ax + ux * arrow_len), px(ay + uy * arrow_len)));
+                            // Arrowhead
+                            let hx = -ux * 5.0 + uy * 4.0;
+                            let hy = -uy * 5.0 - ux * 4.0;
+                            let hx2 = -ux * 5.0 - uy * 4.0;
+                            let hy2 = -uy * 5.0 + ux * 4.0;
+                            let tip_x = ax + ux * arrow_len;
+                            let tip_y = ay + uy * arrow_len;
+                            pb.move_to(point(px(tip_x + hx), px(tip_y + hy)));
+                            pb.line_to(point(px(tip_x), px(tip_y)));
+                            pb.line_to(point(px(tip_x + hx2), px(tip_y + hy2)));
+                            if let Ok(path) = pb.build() {
+                                window.paint_path(path, gpui::hsla(twist_hues[k], 0.9, 0.6, 0.8));
+                            }
+                        }
+                    }
+
+                    // ── Project and depth-sort chord nodes ───────────────
+                    let mut screen: Vec<(usize, f32, f32, f32, u8, bool)> = node_data
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(ox, oy, oz, hi, ic))| {
+                            let (sx, sy, d) = project(ox, oy, oz);
+                            (i, sx, sy, d, hi, ic)
+                        })
+                        .collect();
+                    screen.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
+
+                    let mut spos = vec![(0.0f32, 0.0f32); node_data.len()];
+                    let mut scur = vec![false; node_data.len()];
+                    for &(i, sx, sy, _, _, ic) in &screen {
+                        spos[i] = (sx, sy);
+                        scur[i] = ic;
+                    }
+
+                    // Edges
+                    for &(from, to, dist) in &edges {
+                        let (x1, y1) = spos[from];
+                        let (x2, y2) = spos[to];
+                        let c1 = scur[from]; let c2 = scur[to];
+                        let alpha = if c1 || c2 { 0.45 } else {
+                            (0.04 + 0.12 * (1.0 - dist / 3.5).max(0.0)).min(0.18)
+                        };
+                        let hue = if c1 || c2 { 0.33 } else { 0.58 };
+                        let mut builder = PathBuilder::stroke(px(if c1 || c2 { 1.5 } else { 0.4 }));
+                        builder.move_to(point(px(x1), px(y1)));
+                        builder.line_to(point(px(x2), px(y2)));
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, gpui::hsla(hue, 0.5, 0.5, alpha));
+                        }
+                    }
+
+                    // Trail
+                    for pair in trail.windows(2) {
+                        let (x1, y1) = spos[pair[0]];
+                        let (x2, y2) = spos[pair[1]];
+                        let mut builder = PathBuilder::stroke(px(1.5));
+                        builder.move_to(point(px(x1), px(y1)));
+                        builder.line_to(point(px(x2), px(y2)));
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, gpui::hsla(0.08, 0.9, 0.6, 0.5));
+                        }
+                    }
+
+                    // Nodes (depth-sorted, back-to-front)
+                    for &(_i, x, y, depth, hue_idx, is_current) in &screen {
+                        let ds = 0.7 + 0.3 * (depth + 1.0) / 2.0;
+                        let sz = if is_current { 14.0 * ds } else { 7.0 * ds };
+                        let nb = Bounds {
+                            origin: point(px(x - sz / 2.0), px(y - sz / 2.0)),
+                            size: size(px(sz), px(sz)),
+                        };
+                        if is_current {
+                            let gs = sz * 1.8;
+                            let glow = Bounds {
+                                origin: point(px(x - gs / 2.0), px(y - gs / 2.0)),
+                                size: size(px(gs), px(gs)),
+                            };
+                            window.paint_quad(gpui::fill(glow, gpui::hsla(0.33, 0.9, 0.6, 0.2)));
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(0.33, 0.9, 0.7, 1.0)));
+                        } else {
+                            let hue = hues[hue_idx as usize % hues.len()];
+                            let a = 0.4 + 0.4 * ds;
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(hue, 0.6, 0.5, a)));
+                        }
+                    }
+                }
+            },
+        )
+        .w_full()
+        .h(px(500.0));
+
+        // For triads: wrap canvas with mouse drag for 3D rotation
+        let orbifold_canvas = if !is_dyads {
+            div()
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
+                        this.tonnetz_state.dragging = true;
+                        let pos = event.position;
+                        this.tonnetz_state.last_drag_pos =
+                            Some((pos.x.into(), pos.y.into()));
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                    if this.tonnetz_state.dragging {
+                        if let Some((lx, ly)) = this.tonnetz_state.last_drag_pos {
+                            let dx: f32 = f32::from(event.position.x) - lx;
+                            let dy: f32 = f32::from(event.position.y) - ly;
+                            this.tonnetz_state.yaw += dx * 0.01;
+                            this.tonnetz_state.pitch =
+                                (this.tonnetz_state.pitch + dy * 0.01)
+                                    .clamp(
+                                        -std::f32::consts::FRAC_PI_2,
+                                        std::f32::consts::FRAC_PI_2,
+                                    );
+                            this.tonnetz_state.last_drag_pos =
+                                Some((event.position.x.into(), event.position.y.into()));
+                            cx.notify();
+                        }
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _window, _cx| {
+                        this.tonnetz_state.dragging = false;
+                        this.tonnetz_state.last_drag_pos = None;
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _window, _cx| {
+                        this.tonnetz_state.dragging = false;
+                        this.tonnetz_state.last_drag_pos = None;
+                    }),
+                )
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                    let dy = match event.delta {
+                        gpui::ScrollDelta::Lines(pt) => pt.y,
+                        gpui::ScrollDelta::Pixels(pt) => f32::from(pt.y) / 40.0,
+                    };
+                    this.tonnetz_state.zoom =
+                        (this.tonnetz_state.zoom * (1.0 + dy * 0.1)).clamp(0.3, 5.0);
+                    cx.notify();
+                }))
+                .child(orbifold_canvas)
+        } else {
+            div().child(orbifold_canvas)
+        };
+
+        // ── Voice leading info ──────────────────────────────────────────────
+        let current_edges = self.tonnetz_state.current_edges();
+        let mut vl_items: Vec<(String, f32)> = current_edges
+            .iter()
+            .map(|e| {
+                let other_idx = if e.from == self.tonnetz_state.current_chord_idx {
+                    e.to
+                } else {
+                    e.from
+                };
+                let other = &self.tonnetz_state.nodes[other_idx].chord;
+                (
+                    format!("{} ({})", other.label(), other.type_label()),
+                    e.distance,
+                )
+            })
+            .collect();
+        vl_items.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        vl_items.truncate(8);
+
+        let mut vl_row = div().flex().flex_wrap().gap_2();
+        for (label, dist) in &vl_items {
+            vl_row = vl_row.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("d={dist:.2}")),
+                    ),
+            );
+        }
+
+        let vl_section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("VOICE LEADINGS (nearest)"),
+            )
+            .child(vl_row);
+
+        // Navigation buttons
+        let nav_row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("orb-prev")
+                    .label("\u{25C0} Prev")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        let n = this.tonnetz_state.nodes.len();
+                        if n > 0 {
+                            this.prev_tonnetz_chord_idx =
+                                this.tonnetz_state.current_chord_idx;
+                            this.tonnetz_state.current_chord_idx =
+                                (this.tonnetz_state.current_chord_idx + n - 1) % n;
+                            this.play_tonnetz_chord();
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                Button::new("orb-play")
+                    .label("\u{266B} Play")
+                    .primary()
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.tonnetz_muted = false;
+                        this.play_tonnetz_chord();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("orb-next")
+                    .label("Next \u{25B6}")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        let n = this.tonnetz_state.nodes.len();
+                        if n > 0 {
+                            this.prev_tonnetz_chord_idx =
+                                this.tonnetz_state.current_chord_idx;
+                            this.tonnetz_state.current_chord_idx =
+                                (this.tonnetz_state.current_chord_idx + 1) % n;
+                            this.play_tonnetz_chord();
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(mute_btn);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("ORBIFOLD"),
+                            )
+                            .child(orb_row),
+                    )
+                    .child(status),
+            )
+            .child(nav_row)
+            .child(orbifold_canvas)
+            .child(vl_section)
     }
 
     // ── Soundboard ────────────────────────────────────────────────────────────

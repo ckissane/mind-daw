@@ -63,6 +63,7 @@
 
           # Audio (ALSA)
           alsa-lib
+          alsa-plugins
 
           # D-Bus (required by bluer for BlueZ Bluetooth)
           dbus
@@ -110,6 +111,7 @@
             mesa
             liblsl
             dbus
+            alsa-lib
           ])
         );
 
@@ -146,6 +148,10 @@
           '';
         } // pkgs.lib.optionalAttrs isLinux {
           LD_LIBRARY_PATH = runtimeLibPath;
+          ALSA_PLUGIN_DIR = "${pkgs.alsa-plugins}/lib/alsa-lib";
+          shellHook = ''
+            export ALSA_PLUGIN_DIR="${pkgs.alsa-plugins}/lib/alsa-lib"
+          '';
         });
       }
     );
