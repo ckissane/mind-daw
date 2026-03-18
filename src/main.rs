@@ -2,6 +2,7 @@ mod audio;
 mod calibration;
 mod cognionics;
 mod control;
+mod instrument;
 mod session_log;
 mod recorder;
 mod soundboard;
@@ -26,7 +27,268 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, Disableable, Root, Sizable};
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use streams::{PairedStream, StreamMeta};
+
+// ── Instrument: signal binding targets ────────────────────────────────────────
+
+/// Which musical parameter a continuous EEG signal is currently routed to.
+/// Click the target button in the UI to cycle through options (like Minecraft keybinds).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BindTarget {
+    TonnetzAxis,
+    TonnetzTension,
+    ArpSpeed,
+    ArpSwing,
+    BassFilter,
+    BassVolume,
+    SynthCutoff,
+    SynthResonance,
+    DrumSwing,
+    Unmapped,
+}
+
+impl Default for BindTarget {
+    fn default() -> Self { Self::Unmapped }
+}
+
+impl BindTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TonnetzAxis     => "Tonnetz axis",
+            Self::TonnetzTension  => "Tension",
+            Self::ArpSpeed        => "Arp speed",
+            Self::ArpSwing        => "Arp swing",
+            Self::BassFilter      => "Bass filter",
+            Self::BassVolume      => "Bass volume",
+            Self::SynthCutoff     => "Synth cutoff",
+            Self::SynthResonance  => "Synth resonance",
+            Self::DrumSwing       => "Drum swing",
+            Self::Unmapped        => "— unmapped —",
+        }
+    }
+    /// All targets in order (used to render dropdown options).
+    fn all() -> &'static [BindTarget] {
+        &[
+            BindTarget::TonnetzAxis, BindTarget::TonnetzTension,
+            BindTarget::ArpSpeed, BindTarget::ArpSwing,
+            BindTarget::BassFilter, BindTarget::BassVolume,
+            BindTarget::SynthCutoff, BindTarget::SynthResonance,
+            BindTarget::DrumSwing, BindTarget::Unmapped,
+        ]
+    }
+    /// Cycle forward through targets.
+    fn cycle(self) -> Self {
+        let all = Self::all();
+        let pos = all.iter().position(|t| *t == self).unwrap_or(0);
+        all[(pos + 1) % all.len()]
+    }
+    /// Cycle backward through targets.
+    fn prev(self) -> Self {
+        let all = Self::all();
+        let pos = all.iter().position(|t| *t == self).unwrap_or(0);
+        all[(pos + all.len() - 1) % all.len()]
+    }
+    /// Map a normalised 0..1 signal value to the OSC message for this target.
+    fn dispatch(self, signal_0_1: f32, sender: &instrument::osc::OscSender) {
+        let v = signal_0_1.clamp(0.0, 1.0);
+        let _ = match self {
+            Self::TonnetzAxis     => sender.send_f32("/instrument/tonnetz/axis",    v * 2.0 - 1.0),
+            Self::TonnetzTension  => sender.send_f32("/instrument/tonnetz/tension", v),
+            Self::ArpSpeed        => sender.send_f32("/instrument/arp/speed",       v * 7.5 + 0.5),
+            Self::ArpSwing        => sender.send_f32("/instrument/arp/swing",       v * 0.5),
+            Self::BassFilter      => sender.send_f32("/instrument/bass/filter",     v * 7800.0 + 200.0),
+            Self::BassVolume      => sender.send_f32("/instrument/bass/volume",     v),
+            Self::SynthCutoff     => sender.send_f32("/instrument/synth/cutoff",    v * 7800.0 + 200.0),
+            Self::SynthResonance  => sender.send_f32("/instrument/synth/resonance", v),
+            Self::DrumSwing       => sender.send_f32("/instrument/drums/swing",     v * 0.5),
+            Self::Unmapped        => Ok(()),
+        };
+    }
+}
+
+/// Which continuous EEG signal routes to which musical parameter.
+/// Editable at runtime from the Instrument tab (click a target to cycle).
+#[derive(Debug, Clone)]
+struct SignalBindings {
+    /// Frontal alpha asymmetry (-1 left / +1 right).
+    alpha_asym:  BindTarget,
+    /// Frontal-midline theta power (0–1, normalised).
+    theta:       BindTarget,
+    /// Alpha/beta stability ratio (0–1).
+    stability:   BindTarget,
+    /// Frontal beta power (0–1).
+    beta:        BindTarget,
+    /// Overall alpha power (0–1).
+    alpha_power: BindTarget,
+}
+
+impl Default for SignalBindings {
+    fn default() -> Self {
+        Self {
+            alpha_asym:  BindTarget::TonnetzAxis,
+            theta:       BindTarget::TonnetzTension,
+            stability:   BindTarget::ArpSpeed,
+            beta:        BindTarget::Unmapped,
+            alpha_power: BindTarget::Unmapped,
+        }
+    }
+}
+
+// ── Instrument: per-module synthesis parameters ───────────────────────────────
+
+#[derive(Debug, Clone)]
+struct DrumParams {
+    /// Mix volume 0–1.
+    volume:       f32,
+    /// Swing amount 0–0.5.
+    swing:        f32,
+    /// Pattern index: 0=4-on-floor … 5=Samba.
+    pattern:      u8,
+    // ── Per-instrument on/off ────────────────────────────────────────────
+    kick_on:      bool,
+    snare_on:     bool,
+    hihat_on:     bool,
+    clap_on:      bool,
+    // ── Kick synthesis params ────────────────────────────────────────────
+    /// Fundamental pitch 30–120 Hz.
+    kick_freq:    f32,
+    /// Decay length 0.1–1.0 s.
+    kick_decay:   f32,
+    /// Click-tone blend 0–1.
+    kick_tone:    f32,
+    // ── Snare synthesis params ───────────────────────────────────────────
+    /// Snap transient 0–1.
+    snare_snap:   f32,
+    /// Body decay 0.05–0.5 s.
+    snare_decay:  f32,
+    // ── Hi-hat synthesis param ───────────────────────────────────────────
+    /// 0 = closed, 1 = open.
+    hihat_open:   f32,
+}
+impl Default for DrumParams {
+    fn default() -> Self {
+        Self {
+            volume: 0.7, swing: 0.0, pattern: 0,
+            kick_on: true, snare_on: true, hihat_on: true, clap_on: false,
+            kick_freq: 55.0, kick_decay: 0.4, kick_tone: 0.0,
+            snare_snap: 0.5, snare_decay: 0.18, hihat_open: 0.0,
+        }
+    }
+}
+impl DrumParams {
+    fn pattern_label(&self) -> &'static str {
+        match self.pattern {
+            0 => "4-on-floor", 1 => "Breakbeat", 2 => "Half-time",
+            3 => "Trap",       4 => "Dembow",     _ => "Samba",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BassParams {
+    /// Waveform: 0=Sine, 1=Saw, 2=Square.
+    waveform: u8,
+    /// Filter cutoff normalised 0–1 (maps to 200–8000 Hz).
+    filter:   f32,
+    /// Drive / distortion 0–1.
+    drive:    f32,
+    /// Mix volume 0–1.
+    volume:   f32,
+    /// Bassline pattern index 0–4.
+    pattern:  u8,
+}
+impl Default for BassParams {
+    fn default() -> Self { Self { waveform: 1, filter: 0.5, drive: 0.1, volume: 0.7, pattern: 0 } }
+}
+impl BassParams {
+    fn filter_hz(&self) -> f32 { self.filter * 7800.0 + 200.0 }
+    fn wave_label(&self) -> &'static str {
+        match self.waveform { 0 => "Sine", 1 => "Saw", _ => "Square" }
+    }
+    fn pattern_label(&self) -> &'static str {
+        match self.pattern {
+            0 => "Root", 1 => "Walking", 2 => "Octave", 3 => "Ascending", _ => "Bounce",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArpParams {
+    /// Speed normalised 0–1 (maps to 0.5–8.0 notes/s).
+    speed:     f32,
+    /// Range in octaves 1–4.
+    range:     u8,
+    /// Direction: 0=Up, 1=Up-Down, 2=Random.
+    direction: u8,
+    /// Swing 0–1 (maps to 0–0.5).
+    swing:     f32,
+    /// Waveform morph: 0=Sine · 1=Triangle · 2=Saw · 3=Square (independent of synth).
+    wave:      f32,
+}
+impl Default for ArpParams {
+    fn default() -> Self { Self { speed: 0.5, range: 2, direction: 0, swing: 0.0, wave: 2.0 } }
+}
+impl ArpParams {
+    fn speed_nps(&self) -> f32 { self.speed * 7.5 + 0.5 }
+    fn dir_label(&self) -> &'static str {
+        match self.direction { 0 => "Up", 1 => "Up-Down", _ => "Random" }
+    }
+    fn wave_label(&self) -> String {
+        let names = ["Sine", "Tri", "Saw", "Square"];
+        let idx  = self.wave.floor().clamp(0.0, 2.0) as usize;
+        let frac = self.wave.fract();
+        if frac < 0.05 { names[idx].to_string() }
+        else { format!("{} → {}", names[idx], names[(idx + 1).min(3)]) }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SynthParams {
+    /// Waveform morph position: 0.0=Sine · 1.0=Triangle · 2.0=Saw · 3.0=Square.
+    /// Fractional values blend adjacent waveforms (e.g. 2.3 = mostly Saw, 30% Square).
+    /// In SuperCollider this maps to SelectX.ar([SinOsc, LFTri, LFSaw, LFPulse], morph/3).
+    morph:     f32,
+    /// Filter cutoff normalised 0–1 (maps to 200–8000 Hz).
+    cutoff:    f32,
+    /// Resonance 0–1.
+    resonance: f32,
+    /// Attack normalised 0–1 (maps to 5–2000 ms).
+    attack:    f32,
+    /// Sustain level 0–1.
+    sustain:   f32,
+}
+impl Default for SynthParams {
+    fn default() -> Self {
+        Self { morph: 2.0, cutoff: 0.4, resonance: 0.2, attack: 0.05, sustain: 0.8 }
+    }
+}
+impl SynthParams {
+    fn cutoff_hz(&self) -> f32 { self.cutoff * 7800.0 + 200.0 }
+    fn attack_ms(&self) -> f32 { self.attack * 1995.0 + 5.0 }
+    /// Human-readable label for the current morph position.
+    fn wave_label(&self) -> String {
+        let names = ["Sine", "Triangle", "Saw", "Square"];
+        let idx = self.morph.floor().clamp(0.0, 2.0) as usize;
+        let frac = self.morph.fract();
+        if frac < 0.05 {
+            names[idx].to_string()
+        } else {
+            format!("{} → {}", names[idx], names[(idx + 1).min(3)])
+        }
+    }
+    /// Compute one sample of the morphed waveform at position t (0..1 = one cycle).
+    fn sample(&self, t: f32) -> f32 {
+        sample_wave(t, self.morph)
+    }
+    /// Hue for the waveform colour (sine=purple, triangle=blue, saw=orange, square=red).
+    fn wave_hue(&self) -> f32 {
+        let breakpoints = [0.75_f32, 0.60, 0.08, 0.02];
+        let idx = self.morph.clamp(0.0, 2.999).floor() as usize;
+        let frac = self.morph.fract();
+        breakpoints[idx] + (breakpoints[(idx + 1).min(3)] - breakpoints[idx]) * frac
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -37,6 +299,7 @@ enum Tab {
     Soundboard,
     Tonnetz,
     Calibration,
+    Instrument,
 }
 
 // ── Recorder UI state ─────────────────────────────────────────────────────────
@@ -291,6 +554,42 @@ struct MindDaw {
     profile_name_input: Entity<InputState>,
     /// Names of saved profiles (refreshed on load/save).
     saved_profiles: Vec<String>,
+
+    // ── Instrument ────────────────────────────────────────────────────────────
+    /// Dual-mode interface state (Arrange / Edit{focused}).
+    instrument_mode:   instrument::mode::InstrumentMode,
+    /// Which synthesis layers are currently cued in.
+    instrument_layers: instrument::mode::LayerState,
+    /// OSC output loop — sends continuous values to SuperCollider at 20 Hz.
+    osc_loop:          instrument::osc::OscLoop,
+    /// Timestamp of the last OSC tick (for 50 ms interval).
+    osc_last_tick:     std::time::Instant,
+    /// SuperCollider subprocess manager.
+    sc_process:        instrument::sc_process::ScProcess,
+    /// Shared SC status (state, log lines, metering) — written by background threads.
+    sc_status:         instrument::sc_process::SharedScStatus,
+    /// Manually-controlled synthesis parameters (volume, reverb, BPM, tuning).
+    sc_params:         instrument::osc::ScParams,
+    /// Whether the SC log panel is expanded.
+    sc_log_open:       bool,
+    /// Live EEG signal state (jaw/blink events, band powers) for instrument routing.
+    live_signals:      instrument::signals::SharedSignals,
+    /// Real-time EEG frame processor — push frames here, reads live_signals.
+    live_processor:    instrument::signals::LiveProcessor,
+
+    // ── Per-module synthesis parameters ───────────────────────────────────────
+    drum_params:   DrumParams,
+    bass_params:   BassParams,
+    arp_params:    ArpParams,
+    synth_params:  SynthParams,
+    /// Which continuous EEG signal routes to which musical parameter.
+    signal_bindings: SignalBindings,
+    /// Whether the Synth module is enabled.
+    synth_on: bool,
+    /// Clock started when app launches — used to animate the drum pattern playhead.
+    instrument_clock: std::time::Instant,
+    /// Index of the signal-binding row whose dropdown is currently open (0–4), or None.
+    binding_open: Option<u8>,
 }
 
 const COG_BUFFER_CAPACITY: usize = 150;
@@ -484,6 +783,9 @@ fn compute_pca_feature_vector(channel_data: &[Vec<f32>]) -> Vec<f32> {
 impl MindDaw {
     fn new(stimulus_input: Entity<InputState>, profile_name_input: Entity<InputState>) -> Self {
         let saved_profiles = recorder::storage::list_baseline_profiles();
+        let (live_processor, live_signals) = instrument::signals::LiveProcessor::new();
+        let (sc_proc, sc_status_arc) = instrument::sc_process::ScProcess::new();
+        instrument::sc_process::OscReceiver::spawn(57111, Arc::clone(&sc_status_arc));
         Self {
             discovered: Vec::new(),
             paired: None,
@@ -534,6 +836,25 @@ impl MindDaw {
             stimulus_input,
             profile_name_input,
             saved_profiles,
+
+            instrument_mode:   instrument::mode::InstrumentMode::default(),
+            instrument_layers: instrument::mode::LayerState::default(),
+            osc_loop:          instrument::osc::OscLoop::new(),
+            osc_last_tick:     std::time::Instant::now(),
+            sc_process:        sc_proc,
+            sc_status:         sc_status_arc,
+            sc_params:         instrument::osc::ScParams::default(),
+            sc_log_open:       false,
+            live_signals,
+            live_processor,
+            drum_params:     DrumParams::default(),
+            bass_params:     BassParams::default(),
+            arp_params:      ArpParams::default(),
+            synth_params:    SynthParams::default(),
+            signal_bindings:  SignalBindings::default(),
+            synth_on:         false,
+            instrument_clock: std::time::Instant::now(),
+            binding_open:     None,
         }
     }
 
@@ -871,6 +1192,9 @@ impl MindDaw {
                             }
                             this.rec_ring.push_back(sample.channels);
 
+                            // Feed live processor for instrument events
+                            this.live_processor.push_frame(&sample.channels);
+
                             // Feed baseline recorder if active
                             if let Some(ref mut brec) = this.rec.baseline_rec {
                                 brec.push_sample(&sample.channels);
@@ -983,6 +1307,70 @@ impl MindDaw {
                                         log.log_chord(&chord.short_label(), &midi);
                                     }
                                 }
+                            }
+
+                            // ── Instrument: read live events ─────────────────
+                            if let Ok(mut sig) = this.live_signals.try_lock() {
+                                if sig.jaw_double {
+                                    this.instrument_mode = this.instrument_mode.toggle();
+                                    cx.notify();
+                                }
+                                if sig.jaw_single {
+                                    let mode = this.instrument_mode.clone();
+                                    match mode {
+                                        instrument::mode::InstrumentMode::Arrange => {
+                                            this.instrument_layers.toggle_drums();
+                                            if let Some(ref s) = this.osc_loop.sender {
+                                                let _ = s.send_trigger("/instrument/drums/toggle");
+                                            }
+                                        }
+                                        instrument::mode::InstrumentMode::Edit { .. } => {
+                                            this.instrument_mode = this.instrument_mode.cycle_focus();
+                                        }
+                                    }
+                                    cx.notify();
+                                }
+                                if sig.blink_single {
+                                    this.instrument_layers.toggle_bass();
+                                    if let Some(ref s) = this.osc_loop.sender {
+                                        let _ = s.send_trigger("/instrument/bass/toggle");
+                                    }
+                                    cx.notify();
+                                }
+                                if sig.blink_double {
+                                    this.instrument_layers.toggle_arp();
+                                    cx.notify();
+                                }
+                                sig.clear_events();
+                            }
+
+                            // ── Instrument: signal-binding OSC at 20 Hz ──────
+                            if this.osc_last_tick.elapsed().as_millis() >= 50 {
+                                if let Some(ref sender) = this.osc_loop.sender {
+                                    let ctrl = &this.control_state;
+                                    let b    = &this.signal_bindings;
+                                    // Continuous signal → normalised 0..1 then dispatched
+                                    // alpha_asym comes in -1..+1, normalise to 0..1
+                                    let asym_01 = (ctrl.motion_x + 1.0) * 0.5;
+                                    b.alpha_asym .dispatch(asym_01,          sender);
+                                    b.theta      .dispatch(ctrl.motion_y.max(0.0), sender);
+                                    b.stability  .dispatch(ctrl.stability,   sender);
+                                    b.beta       .dispatch(ctrl.tension,     sender);
+                                    // Send current module params from manual controls too
+                                    let ap = &this.arp_params;
+                                    let _ = sender.send_f32("/instrument/arp/speed",     ap.speed_nps());
+                                    let _ = sender.send_f32("/instrument/arp/direction", ap.direction as f32);
+                                    let _ = sender.send_f32("/instrument/bass/filter",   this.bass_params.filter_hz());
+                                    let _ = sender.send_f32("/instrument/bass/volume",   this.bass_params.volume);
+                                    let _ = sender.send_f32("/instrument/drums/volume",  this.drum_params.volume);
+                                    let _ = sender.send_f32("/instrument/drums/swing",   this.drum_params.swing);
+                                    let _ = sender.send_f32("/instrument/synth/cutoff",  this.synth_params.cutoff_hz());
+                                    let _ = sender.send_f32("/instrument/synth/resonance", this.synth_params.resonance);
+                                    // Always keep Tonnetz position flowing
+                                    let _ = sender.send_f32("/instrument/tonnetz/axis",    ctrl.motion_x);
+                                    let _ = sender.send_f32("/instrument/tonnetz/tension", ctrl.tension);
+                                }
+                                this.osc_last_tick = std::time::Instant::now();
                             }
 
                             // Recorder: ARM auto-detect
@@ -1460,8 +1848,20 @@ impl MindDaw {
                             cx.notify();
                         }))
                 };
+                let instr_btn = if active_tab == Tab::Instrument {
+                    Button::new("tab-instr").label("🧠 Instrument").primary()
+                } else {
+                    Button::new("tab-instr")
+                        .label("🧠 Instrument")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.active_tab = Tab::Instrument;
+                            cx.notify();
+                        }))
+                };
 
-                let content: Div = if active_tab == Tab::Calibration {
+                let content: Div = if active_tab == Tab::Instrument {
+                    self.render_instrument_view(cx)
+                } else if active_tab == Tab::Calibration {
                     self.render_calibration_view(cx)
                 } else if active_tab == Tab::Tonnetz {
                     self.render_tonnetz_view(cx)
@@ -1540,6 +1940,7 @@ impl MindDaw {
                                 .child(soundboard_btn)
                                 .child(tonnetz_btn)
                                 .child(calib_btn)
+                                .child(instr_btn)
                                 .child(audio_btn)
                                 .child(
                                     Button::new("cog-disconnect")
@@ -3897,6 +4298,1710 @@ impl MindDaw {
             .child(vl_section)
     }
 
+    // ── Instrument ──────────────────────────────────────────────────────────
+
+    fn render_instrument_view(&mut self, cx: &mut Context<Self>) -> Div {
+        let mode       = self.instrument_mode.clone();
+        let layers     = self.instrument_layers.clone();
+        let mode_hue   = mode.hue();
+        let mode_label = mode.label();
+        let chord_label = self.tonnetz_state
+            .current_chord()
+            .map(|c| c.short_label())
+            .unwrap_or_else(|| "—".to_string());
+
+        let motion_x  = self.control_state.motion_x;
+        let motion_y  = self.control_state.motion_y;
+        let tension   = self.control_state.tension;
+        let stability = self.control_state.stability;
+
+        let bindings = self.signal_bindings.clone();
+        let drum     = self.drum_params.clone();
+        let bass     = self.bass_params.clone();
+        let arp      = self.arp_params.clone();
+        let synth    = self.synth_params.clone();
+        let synth_on = self.synth_on;
+
+        let muted = cx.theme().muted_foreground;
+        let fg    = cx.theme().foreground;
+        let bdr   = cx.theme().border;
+
+        // ── Helpers ───────────────────────────────────────────────────────────
+
+        // Horizontal signal bar (-1..+1 range, centred)
+        // Fixed-width centred signal bar (−1..+1 range, fill shows proportion)
+        let asym_bar = |val: f32, hue: f32| -> Div {
+            let pct = ((val + 1.0) * 0.5).clamp(0.0, 1.0);
+            div().w(px(180.0)).flex_shrink_0().h(px(8.0)).rounded_sm()
+                .bg(gpui::hsla(0.0, 0.0, 0.12, 1.0))
+                .child(div().h_full().rounded_sm().bg(gpui::hsla(hue, 0.7, 0.5, 1.0))
+                    .w(px(pct * 180.0)))
+        };
+
+        // Fixed-width signal bar (0..1 range)
+        let uni_bar = |val: f32, hue: f32| -> Div {
+            let pct = val.clamp(0.0, 1.0);
+            div().w(px(180.0)).flex_shrink_0().h(px(8.0)).rounded_sm()
+                .bg(gpui::hsla(0.0, 0.0, 0.12, 1.0))
+                .child(div().h_full().rounded_sm().bg(gpui::hsla(hue, 0.7, 0.5, 1.0))
+                    .w(px(pct * 180.0)))
+        };
+
+        // Section header label
+        let section_label = |text: &'static str| -> Div {
+            div().text_xs().font_weight(gpui::FontWeight::BOLD)
+                .text_color(fg)
+                .mb(px(6.0))
+                .child(text)
+        };
+
+        // ── MODE BAR ─────────────────────────────────────────────────────────
+        let hint = if mode.is_arrange() {
+            "jaw×1 = drums   blink = bass   blink×2 = arp"
+        } else {
+            "jaw×1 = cycle module"
+        };
+        let mode_bar = div()
+            .flex().items_center().justify_between()
+            .px_4().py_2()
+            .border_b_1().border_color(bdr)
+            .child(
+                div().flex().items_center().gap_3()
+                    .child(div().w(px(10.0)).h(px(10.0)).rounded_full()
+                        .bg(gpui::hsla(mode_hue, 0.7, 0.55, 1.0)))
+                    .child(div().text_sm().font_weight(gpui::FontWeight::BOLD)
+                        .text_color(gpui::hsla(mode_hue, 0.7, 0.7, 1.0))
+                        .child(mode_label))
+                    .child(div().text_sm().text_color(fg).child(chord_label.clone()))
+            )
+            .child(
+                div().flex().items_center().gap_3()
+                    .child(div().text_xs().text_color(muted).child("jaw×2 = switch mode"))
+                    .child(div().text_xs().text_color(muted).child(hint))
+                    .child(if self.osc_loop.sender.is_none() {
+                        Button::new("instr-connect").label("Connect SC").small()
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.osc_loop.connect("127.0.0.1", 57120);
+                                cx.notify();
+                            }))
+                    } else {
+                        Button::new("instr-connect").label("● SC").small()
+                    })
+            );
+
+        // ── SECTION 1: SIGNAL → MUSIC MAPPING ────────────────────────────
+        // Each signal row has:  ‹ (prev)  [current target label - fixed width]  › (next)
+        // Use ‹ › to step backward/forward through the options list.
+        let bind_open = self.binding_open;
+
+        // Inline option list that expands below a row when binding_open matches its index.
+        let options_list = |row_idx: u8, current: BindTarget| -> Div {
+            let visible = bind_open == Some(row_idx);
+            div().flex().flex_col()
+                .pl(px(104.0)) // align under the label column
+                .children(if visible {
+                    BindTarget::all().iter().map(|&t| {
+                        let is_sel = t == current;
+                        div().flex().items_center().gap_2().px_2().py(px(2.0)).rounded_sm()
+                            .bg(if is_sel {
+                                gpui::hsla(0.0, 0.0, 0.20, 1.0)
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .child(div().text_xs().text_color(if is_sel { fg } else { muted })
+                                .child(t.label()))
+                    }).collect::<Vec<_>>()
+                } else {
+                    vec![]
+                })
+        };
+
+        // Shared dropdown selector widget — ‹ label › + click label to open/close list.
+        // Returns (selector_div, options_div) — caller appends both to its column.
+
+        let mapping_section = div().flex().flex_col().p_4()
+            .border_b_1().border_color(bdr)
+            .child(section_label("SIGNAL → MUSIC MAPPING"))
+            .child(div().text_xs().text_color(muted).mb(px(8.0))
+                .child("Use ‹ › to step through targets, or click the label to open the full list"))
+
+            // ── α asymmetry ──
+            .child(
+                div().flex().items_center().gap_2().py(px(3.0))
+                    .child(div().flex().flex_col().w(px(100.0))
+                        .child(div().text_xs().text_color(fg).child("α asymmetry"))
+                        .child(div().text_xs().text_color(muted).child("left/right focus")))
+                    .child(asym_bar(motion_x, 0.33))
+                    .child(div().text_xs().text_color(muted).w(px(38.0))
+                        .child(format!("{:+.2}", motion_x)))
+                    .child(div().text_xs().text_color(muted).child("→"))
+                    .child(Button::new("ba-prev").label("‹").small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.signal_bindings.alpha_asym = this.signal_bindings.alpha_asym.prev();
+                            this.binding_open = None; cx.notify();
+                        })))
+                    .child(
+                        div().id("ba-toggle").w(px(120.0)).text_xs().text_color(fg)
+                            .border_1().border_color(bdr).rounded_sm().px_2().py(px(2.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.binding_open = if this.binding_open == Some(0) { None } else { Some(0) };
+                                cx.notify();
+                            }))
+                            .child(format!("{} ▾", bindings.alpha_asym.label()))
+                    )
+                    .child(Button::new("ba-next").label("›").small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.signal_bindings.alpha_asym = this.signal_bindings.alpha_asym.cycle();
+                            this.binding_open = None; cx.notify();
+                        })))
+            )
+            .child({
+                let cur = bindings.alpha_asym;
+                let vis = bind_open == Some(0);
+                div().flex().flex_col().pl(px(102.0))
+                    .children(if vis {
+                        BindTarget::all().iter().enumerate().map(|(i, &t)| {
+                            let is_sel = t == cur;
+                            div().id(SharedString::from(format!("oa-{i}")))
+                                .px_2().py(px(2.0)).rounded_sm()
+                                .bg(if is_sel { gpui::hsla(0.0,0.0,0.20,1.0) } else { gpui::transparent_black() })
+                                .child(div().text_xs().text_color(if is_sel { fg } else { muted }).child(t.label()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.signal_bindings.alpha_asym = t;
+                                    this.binding_open = None; cx.notify();
+                                }))
+                        }).collect::<Vec<_>>()
+                    } else { vec![] })
+            })
+
+            // ── θ power ──
+            .child(
+                div().flex().items_center().gap_2().py(px(3.0))
+                    .child(div().flex().flex_col().w(px(100.0))
+                        .child(div().text_xs().text_color(fg).child("θ power (Fz)"))
+                        .child(div().text_xs().text_color(muted).child("drowsy / deep")))
+                    .child(uni_bar(motion_y.max(0.0), 0.58))
+                    .child(div().text_xs().text_color(muted).w(px(38.0))
+                        .child(format!("{:.2}", motion_y.max(0.0))))
+                    .child(div().text_xs().text_color(muted).child("→"))
+                    .child(Button::new("bt-prev").label("‹").small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.signal_bindings.theta = this.signal_bindings.theta.prev();
+                            this.binding_open = None; cx.notify();
+                        })))
+                    .child(
+                        div().id("bt-toggle").w(px(120.0)).text_xs().text_color(fg)
+                            .border_1().border_color(bdr).rounded_sm().px_2().py(px(2.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.binding_open = if this.binding_open == Some(1) { None } else { Some(1) };
+                                cx.notify();
+                            }))
+                            .child(format!("{} ▾", bindings.theta.label()))
+                    )
+                    .child(Button::new("bt-next").label("›").small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.signal_bindings.theta = this.signal_bindings.theta.cycle();
+                            this.binding_open = None; cx.notify();
+                        })))
+            )
+            .child({
+                let cur = bindings.theta;
+                let vis = bind_open == Some(1);
+                div().flex().flex_col().pl(px(102.0))
+                    .children(if vis {
+                        BindTarget::all().iter().enumerate().map(|(i, &t)| {
+                            let is_sel = t == cur;
+                            div().id(SharedString::from(format!("ot-{i}")))
+                                .px_2().py(px(2.0)).rounded_sm()
+                                .bg(if is_sel { gpui::hsla(0.0,0.0,0.20,1.0) } else { gpui::transparent_black() })
+                                .child(div().text_xs().text_color(if is_sel { fg } else { muted }).child(t.label()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.signal_bindings.theta = t;
+                                    this.binding_open = None; cx.notify();
+                                }))
+                        }).collect::<Vec<_>>()
+                    } else { vec![] })
+            })
+
+            // ── Stability ──
+            .child(
+                div().flex().items_center().gap_2().py(px(3.0))
+                    .child(div().flex().flex_col().w(px(100.0))
+                        .child(div().text_xs().text_color(fg).child("Stability"))
+                        .child(div().text_xs().text_color(muted).child("calm α dominance")))
+                    .child(uni_bar(stability, 0.50))
+                    .child(div().text_xs().text_color(muted).w(px(38.0))
+                        .child(format!("{:.2}", stability)))
+                    .child(div().text_xs().text_color(muted).child("→"))
+                    .child(Button::new("bs-prev").label("‹").small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.signal_bindings.stability = this.signal_bindings.stability.prev();
+                            this.binding_open = None; cx.notify();
+                        })))
+                    .child(
+                        div().id("bs-toggle").w(px(120.0)).text_xs().text_color(fg)
+                            .border_1().border_color(bdr).rounded_sm().px_2().py(px(2.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.binding_open = if this.binding_open == Some(2) { None } else { Some(2) };
+                                cx.notify();
+                            }))
+                            .child(format!("{} ▾", bindings.stability.label()))
+                    )
+                    .child(Button::new("bs-next").label("›").small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.signal_bindings.stability = this.signal_bindings.stability.cycle();
+                            this.binding_open = None; cx.notify();
+                        })))
+            )
+            .child({
+                let cur = bindings.stability;
+                let vis = bind_open == Some(2);
+                div().flex().flex_col().pl(px(102.0))
+                    .children(if vis {
+                        BindTarget::all().iter().enumerate().map(|(i, &t)| {
+                            let is_sel = t == cur;
+                            div().id(SharedString::from(format!("os-{i}"))).px_2().py(px(2.0)).rounded_sm()
+                                .bg(if is_sel { gpui::hsla(0.0,0.0,0.20,1.0) } else { gpui::transparent_black() })
+                                .child(div().text_xs().text_color(if is_sel { fg } else { muted }).child(t.label()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.signal_bindings.stability = t;
+                                    this.binding_open = None; cx.notify();
+                                }))
+                        }).collect::<Vec<_>>()
+                    } else { vec![] })
+            })
+
+            // ── β power ──
+            .child(
+                div().flex().items_center().gap_2().py(px(3.0))
+                    .child(div().flex().flex_col().w(px(100.0))
+                        .child(div().text_xs().text_color(fg).child("β power"))
+                        .child(div().text_xs().text_color(muted).child("active / focused")))
+                    .child(uni_bar(tension, 0.08))
+                    .child(div().text_xs().text_color(muted).w(px(38.0))
+                        .child(format!("{:.2}", tension)))
+                    .child(div().text_xs().text_color(muted).child("→"))
+                    .child(Button::new("bb-prev").label("‹").small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.signal_bindings.beta = this.signal_bindings.beta.prev();
+                            this.binding_open = None; cx.notify();
+                        })))
+                    .child(
+                        div().id("bb-toggle").w(px(120.0)).text_xs().text_color(fg)
+                            .border_1().border_color(bdr).rounded_sm().px_2().py(px(2.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.binding_open = if this.binding_open == Some(3) { None } else { Some(3) };
+                                cx.notify();
+                            }))
+                            .child(format!("{} ▾", bindings.beta.label()))
+                    )
+                    .child(Button::new("bb-next").label("›").small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.signal_bindings.beta = this.signal_bindings.beta.cycle();
+                            this.binding_open = None; cx.notify();
+                        })))
+            )
+            .child({
+                let cur = bindings.beta;
+                let vis = bind_open == Some(3);
+                div().flex().flex_col().pl(px(102.0))
+                    .children(if vis {
+                        BindTarget::all().iter().enumerate().map(|(i, &t)| {
+                            let is_sel = t == cur;
+                            div().id(SharedString::from(format!("ob-{i}"))).px_2().py(px(2.0)).rounded_sm()
+                                .bg(if is_sel { gpui::hsla(0.0,0.0,0.20,1.0) } else { gpui::transparent_black() })
+                                .child(div().text_xs().text_color(if is_sel { fg } else { muted }).child(t.label()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.signal_bindings.beta = t;
+                                    this.binding_open = None; cx.notify();
+                                }))
+                        }).collect::<Vec<_>>()
+                    } else { vec![] })
+            })
+
+            // ── Fixed triggers ──
+            .child(div().mt(px(10.0)).mb(px(4.0)).text_xs()
+                .font_weight(gpui::FontWeight::BOLD).text_color(fg)
+                .child("TRIGGERS  (fixed bindings)"))
+            .children(vec![
+                ("jaw  ×2", "🔒  Switch mode:  ARRANGE ↔ EDIT"),
+                ("jaw  ×1", "🔒  Toggle drums  /  Cycle focused module"),
+                ("blink ×1","🔒  Toggle bass"),
+                ("blink×2", "🔒  Toggle arp"),
+            ].into_iter().map(|(sig, action)| {
+                div().flex().items_center().gap_2().py(px(2.0))
+                    .child(div().text_xs().text_color(muted).w(px(60.0)).child(sig))
+                    .child(div().text_xs().text_color(muted).child(action))
+            }));
+
+        // Suppress unused helper (options_list was superseded by inline .child blocks above)
+        let _ = options_list;
+
+        // ── SECTION 2: MODULE CARDS (VST-style) ───────────────────────────
+
+        // Module parameter rows use explicit +/- buttons below.
+
+        // — DRUMS card —
+        let drums_card = {
+            let on = layers.drums_on;
+            let d  = drum.clone();
+            div().flex().flex_col().p_3().min_w(px(180.0))
+                .border_1().border_color(if on { gpui::hsla(0.33,0.5,0.4,1.0) } else { bdr })
+                .rounded_md()
+                // Header row: name + on/off toggle
+                .child(
+                    div().flex().items_center().gap_2().mb(px(6.0))
+                        .child(div().w(px(8.0)).h(px(8.0)).rounded_full()
+                            .bg(if on { gpui::hsla(0.33,0.7,0.55,1.0) } else { gpui::hsla(0.0,0.0,0.3,1.0) }))
+                        .child(div().text_sm().font_weight(gpui::FontWeight::BOLD)
+                            .text_color(if on { fg } else { muted })
+                            .child("DRUMS"))
+                        .child(Button::new("drums-toggle").label(if on { "On" } else { "Off" }).small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.instrument_layers.toggle_drums();
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_trigger("/instrument/drums/toggle");
+                                }
+                                cx.notify();
+                            })))
+                )
+                // ── K / S / H / C per-instrument toggles ─────────────────
+                .child(
+                    div().flex().items_center().gap_1().py(px(2.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Voices"))
+                        // Kick
+                        .child(div().id("drum-k-tog")
+                            .px(px(5.0)).py(px(2.0)).rounded_sm()
+                            .cursor_pointer()
+                            .bg(if d.kick_on { gpui::hsla(0.33,0.6,0.30,1.0) } else { gpui::hsla(0.0,0.0,0.12,1.0) })
+                            .text_xs().text_color(if d.kick_on { fg } else { muted })
+                            .child("K")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.kick_on = !this.drum_params.kick_on;
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let v = if this.drum_params.kick_on { 1.0_f32 } else { 0.0 };
+                                    let _ = s.send_f32("/instrument/drums/kick/on", v);
+                                }
+                                cx.notify();
+                            })))
+                        // Snare
+                        .child(div().id("drum-s-tog")
+                            .px(px(5.0)).py(px(2.0)).rounded_sm()
+                            .cursor_pointer()
+                            .bg(if d.snare_on { gpui::hsla(0.60,0.6,0.30,1.0) } else { gpui::hsla(0.0,0.0,0.12,1.0) })
+                            .text_xs().text_color(if d.snare_on { fg } else { muted })
+                            .child("S")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.snare_on = !this.drum_params.snare_on;
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let v = if this.drum_params.snare_on { 1.0_f32 } else { 0.0 };
+                                    let _ = s.send_f32("/instrument/drums/snare/on", v);
+                                }
+                                cx.notify();
+                            })))
+                        // Hi-hat
+                        .child(div().id("drum-h-tog")
+                            .px(px(5.0)).py(px(2.0)).rounded_sm()
+                            .cursor_pointer()
+                            .bg(if d.hihat_on { gpui::hsla(0.50,0.6,0.30,1.0) } else { gpui::hsla(0.0,0.0,0.12,1.0) })
+                            .text_xs().text_color(if d.hihat_on { fg } else { muted })
+                            .child("H")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.hihat_on = !this.drum_params.hihat_on;
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let v = if this.drum_params.hihat_on { 1.0_f32 } else { 0.0 };
+                                    let _ = s.send_f32("/instrument/drums/hihat/on", v);
+                                }
+                                cx.notify();
+                            })))
+                        // Clap
+                        .child(div().id("drum-c-tog")
+                            .px(px(5.0)).py(px(2.0)).rounded_sm()
+                            .cursor_pointer()
+                            .bg(if d.clap_on { gpui::hsla(0.95,0.6,0.30,1.0) } else { gpui::hsla(0.0,0.0,0.12,1.0) })
+                            .text_xs().text_color(if d.clap_on { fg } else { muted })
+                            .child("C")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.clap_on = !this.drum_params.clap_on;
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let v = if this.drum_params.clap_on { 1.0_f32 } else { 0.0 };
+                                    let _ = s.send_f32("/instrument/drums/clap/on", v);
+                                }
+                                cx.notify();
+                            })))
+                )
+                // Pattern
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Pattern"))
+                        .child(Button::new("drum-pat").label(drum.pattern_label()).small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.pattern = (this.drum_params.pattern + 1) % 6;
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/pattern",
+                                        this.drum_params.pattern as f32);
+                                }
+                                cx.notify();
+                            })))
+                )
+                // Volume
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Volume"))
+                        .child(Button::new("drum-vol-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.volume = (this.drum_params.volume - 0.05).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/volume", this.drum_params.volume);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(36.0))
+                            .child(format!("{:.0}%", drum.volume * 100.0)))
+                        .child(Button::new("drum-vol-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.volume = (this.drum_params.volume + 0.05).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/volume", this.drum_params.volume);
+                                }
+                                cx.notify();
+                            })))
+                )
+                // Swing
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Swing"))
+                        .child(Button::new("drum-swg-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.swing = (this.drum_params.swing - 0.05).max(0.0);
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(36.0))
+                            .child(format!("{:.0}%", drum.swing * 100.0)))
+                        .child(Button::new("drum-swg-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.swing = (this.drum_params.swing + 0.05).min(0.5);
+                                cx.notify();
+                            })))
+                )
+                // ── Kick params ──────────────────────────────────────────
+                .child(div().text_xs().text_color(muted).mt(px(4.0)).mb(px(1.0)).child("— Kick —"))
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Freq"))
+                        .child(Button::new("kick-freq-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.kick_freq = (this.drum_params.kick_freq - 2.0).max(30.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/kick/freq", this.drum_params.kick_freq);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(40.0))
+                            .child(format!("{:.0} Hz", d.kick_freq)))
+                        .child(Button::new("kick-freq-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.kick_freq = (this.drum_params.kick_freq + 2.0).min(120.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/kick/freq", this.drum_params.kick_freq);
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Decay"))
+                        .child(Button::new("kick-dec-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.kick_decay = (this.drum_params.kick_decay - 0.05).max(0.1);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/kick/decay", this.drum_params.kick_decay);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(40.0))
+                            .child(format!("{:.2} s", d.kick_decay)))
+                        .child(Button::new("kick-dec-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.kick_decay = (this.drum_params.kick_decay + 0.05).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/kick/decay", this.drum_params.kick_decay);
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Tone"))
+                        .child(Button::new("kick-tone-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.kick_tone = (this.drum_params.kick_tone - 0.1).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/kick/tone", this.drum_params.kick_tone);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(40.0))
+                            .child(format!("{:.1}", d.kick_tone)))
+                        .child(Button::new("kick-tone-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.kick_tone = (this.drum_params.kick_tone + 0.1).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/kick/tone", this.drum_params.kick_tone);
+                                }
+                                cx.notify();
+                            })))
+                )
+                // ── Snare params ─────────────────────────────────────────
+                .child(div().text_xs().text_color(muted).mt(px(4.0)).mb(px(1.0)).child("— Snare —"))
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Snap"))
+                        .child(Button::new("snare-snap-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.snare_snap = (this.drum_params.snare_snap - 0.1).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/snare/snap", this.drum_params.snare_snap);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(40.0))
+                            .child(format!("{:.1}", d.snare_snap)))
+                        .child(Button::new("snare-snap-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.snare_snap = (this.drum_params.snare_snap + 0.1).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/snare/snap", this.drum_params.snare_snap);
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Decay"))
+                        .child(Button::new("snare-dec-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.snare_decay = (this.drum_params.snare_decay - 0.02).max(0.05);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/snare/decay", this.drum_params.snare_decay);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(40.0))
+                            .child(format!("{:.2} s", d.snare_decay)))
+                        .child(Button::new("snare-dec-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.snare_decay = (this.drum_params.snare_decay + 0.02).min(0.5);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/snare/decay", this.drum_params.snare_decay);
+                                }
+                                cx.notify();
+                            })))
+                )
+                // ── Hi-hat param ─────────────────────────────────────────
+                .child(div().text_xs().text_color(muted).mt(px(4.0)).mb(px(1.0)).child("— Hi-hat —"))
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(50.0)).child("Open"))
+                        .child(Button::new("hihat-open-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.hihat_open = (this.drum_params.hihat_open - 0.1).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/hihat/open", this.drum_params.hihat_open);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(40.0))
+                            .child(format!("{:.1}", d.hihat_open)))
+                        .child(Button::new("hihat-open-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drum_params.hihat_open = (this.drum_params.hihat_open + 0.1).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/drums/hihat/open", this.drum_params.hihat_open);
+                                }
+                                cx.notify();
+                            })))
+                )
+        };
+
+        // — BASS card —
+        let bass_card = {
+            let on = layers.bass_on;
+            div().flex().flex_col().p_3().min_w(px(160.0))
+                .border_1().border_color(if on { gpui::hsla(0.60,0.5,0.4,1.0) } else { bdr })
+                .rounded_md()
+                .child(
+                    div().flex().items_center().gap_2().mb(px(6.0))
+                        .child(div().w(px(8.0)).h(px(8.0)).rounded_full()
+                            .bg(if on { gpui::hsla(0.60,0.7,0.55,1.0) } else { gpui::hsla(0.0,0.0,0.3,1.0) }))
+                        .child(div().text_sm().font_weight(gpui::FontWeight::BOLD)
+                            .text_color(if on { fg } else { muted })
+                            .child("BASS"))
+                        .child(Button::new("bass-toggle").label(if on { "On" } else { "Off" }).small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.instrument_layers.toggle_bass();
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_trigger("/instrument/bass/toggle");
+                                }
+                                cx.notify();
+                            })))
+                )
+                // Waveform selector (radio-style row)
+                .child(
+                    div().flex().flex_col().gap_0()
+                        .child(div().text_xs().text_color(muted).mb(px(2.0)).child("Waveform"))
+                        .child(
+                            div().flex().gap_1()
+                                .children(["Sine","Saw","Square"].iter().enumerate().map(|(i, &name)| {
+                                    let selected = bass.waveform as usize == i;
+                                    if selected {
+                                        Button::new(SharedString::from(format!("bass-wave-{i}")))
+                                            .label(name).small().primary()
+                                    } else {
+                                        Button::new(SharedString::from(format!("bass-wave-{i}")))
+                                            .label(name).small()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.bass_params.waveform = i as u8;
+                                                if let Some(ref s) = this.osc_loop.sender {
+                                                    let _ = s.send_f32("/instrument/bass/waveform", i as f32);
+                                                }
+                                                cx.notify();
+                                            }))
+                                    }
+                                }))
+                        )
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Filter"))
+                        .child(Button::new("bass-filt-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bass_params.filter = (this.bass_params.filter - 0.05).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/bass/filter", this.bass_params.filter_hz());
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(46.0))
+                            .child(format!("{:.0}Hz", bass.filter_hz())))
+                        .child(Button::new("bass-filt-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bass_params.filter = (this.bass_params.filter + 0.05).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/bass/filter", this.bass_params.filter_hz());
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Drive"))
+                        .child(Button::new("bass-drv-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bass_params.drive = (this.bass_params.drive - 0.05).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/bass/drive", this.bass_params.drive);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(46.0))
+                            .child(format!("{:.0}%", bass.drive * 100.0)))
+                        .child(Button::new("bass-drv-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bass_params.drive = (this.bass_params.drive + 0.05).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/bass/drive", this.bass_params.drive);
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Pattern"))
+                        .child(Button::new("bass-pat").label(bass.pattern_label()).small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.bass_params.pattern = (this.bass_params.pattern + 1) % 5;
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_trigger("/instrument/bass/pattern");
+                                }
+                                cx.notify();
+                            })))
+                )
+        };
+
+        // — ARP card —
+        let arp_card = {
+            let on = layers.arp_on;
+            div().flex().flex_col().p_3().min_w(px(160.0))
+                .border_1().border_color(if on { gpui::hsla(0.11,0.5,0.4,1.0) } else { bdr })
+                .rounded_md()
+                .child(
+                    div().flex().items_center().gap_2().mb(px(6.0))
+                        .child(div().w(px(8.0)).h(px(8.0)).rounded_full()
+                            .bg(if on { gpui::hsla(0.11,0.7,0.55,1.0) } else { gpui::hsla(0.0,0.0,0.3,1.0) }))
+                        .child(div().text_sm().font_weight(gpui::FontWeight::BOLD)
+                            .text_color(if on { fg } else { muted })
+                            .child("ARP"))
+                        .child(Button::new("arp-toggle").label(if on { "On" } else { "Off" }).small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.instrument_layers.toggle_arp();
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_trigger("/instrument/arp/toggle");
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Speed"))
+                        .child(Button::new("arp-spd-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.arp_params.speed = (this.arp_params.speed - 0.05).max(0.0);
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(46.0))
+                            .child(format!("{:.1}n/s", arp.speed_nps())))
+                        .child(Button::new("arp-spd-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.arp_params.speed = (this.arp_params.speed + 0.05).min(1.0);
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Range"))
+                        .child(Button::new("arp-rng-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.arp_params.range > 1 { this.arp_params.range -= 1; }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(46.0))
+                            .child(format!("{} oct", arp.range)))
+                        .child(Button::new("arp-rng-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.arp_params.range < 4 { this.arp_params.range += 1; }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Direction"))
+                        .child(Button::new("arp-dir").label(arp.dir_label()).small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.arp_params.direction = (this.arp_params.direction + 1) % 3;
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Wave"))
+                        .child(Button::new("arp-wav-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.arp_params.wave = (this.arp_params.wave - 0.1).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/arp/wave", this.arp_params.wave);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(72.0))
+                            .child(format!("{:.1} ({})", arp.wave, arp.wave_label())))
+                        .child(Button::new("arp-wav-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.arp_params.wave = (this.arp_params.wave + 0.1).min(3.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/arp/wave", this.arp_params.wave);
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Swing"))
+                        .child(Button::new("arp-swg-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.arp_params.swing = (this.arp_params.swing - 0.05).max(0.0);
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(46.0))
+                            .child(format!("{:.0}%", arp.swing * 100.0)))
+                        .child(Button::new("arp-swg-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.arp_params.swing = (this.arp_params.swing + 0.05).min(0.5);
+                                cx.notify();
+                            })))
+                )
+        };
+
+        // — SYNTH card —
+        let synth_card = {
+            let on = synth_on;
+            div().flex().flex_col().p_3().min_w(px(170.0))
+                .border_1().border_color(if on { gpui::hsla(0.75,0.5,0.4,1.0) } else { bdr })
+                .rounded_md()
+                .child(
+                    div().flex().items_center().gap_2().mb(px(4.0))
+                        .child(div().w(px(8.0)).h(px(8.0)).rounded_full()
+                            .bg(if on { gpui::hsla(0.75,0.7,0.55,1.0) } else { gpui::hsla(0.0,0.0,0.3,1.0) }))
+                        .child(div().text_sm().font_weight(gpui::FontWeight::BOLD)
+                            .text_color(if on { fg } else { muted })
+                            .child("SYNTH"))
+                        .child(Button::new("synth-toggle").label(if on { "On" } else { "Off" }).small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_on = !this.synth_on;
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let gate = if this.synth_on { 1.0_f32 } else { 0.0 };
+                                    let _ = s.send_f32("/instrument/tonnetz/on", gate);
+                                }
+                                cx.notify();
+                            })))
+                )
+                // Continuous waveform morph control (0.0 Sine → 1.0 Triangle → 2.0 Saw → 3.0 Square)
+                .child(
+                    div().flex().flex_col().gap_0().mb(px(4.0))
+                        .child(div().text_xs().text_color(muted).mb(px(2.0))
+                            .child("Wave shape  (0=Sine · 1=Triangle · 2=Saw · 3=Square)"))
+                        .child(
+                            div().flex().items_center().gap_1()
+                                .child(Button::new("syn-mor-dn").label("−").small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.synth_params.morph = (this.synth_params.morph - 0.1).max(0.0);
+                                        if let Some(ref s) = this.osc_loop.sender {
+                                            let _ = s.send_f32("/instrument/synth/morph", this.synth_params.morph);
+                                        }
+                                        cx.notify();
+                                    })))
+                                .child(div().text_xs().text_color(fg).w(px(130.0))
+                                    .child(format!("{:.1}  ({})", synth.morph, synth.wave_label())))
+                                .child(Button::new("syn-mor-up").label("+").small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.synth_params.morph = (this.synth_params.morph + 0.1).min(3.0);
+                                        if let Some(ref s) = this.osc_loop.sender {
+                                            let _ = s.send_f32("/instrument/synth/morph", this.synth_params.morph);
+                                        }
+                                        cx.notify();
+                                    })))
+                        )
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Cutoff"))
+                        .child(Button::new("syn-cut-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_params.cutoff = (this.synth_params.cutoff - 0.05).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/synth/cutoff", this.synth_params.cutoff_hz());
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(52.0))
+                            .child(format!("{:.0}Hz", synth.cutoff_hz())))
+                        .child(Button::new("syn-cut-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_params.cutoff = (this.synth_params.cutoff + 0.05).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/synth/cutoff", this.synth_params.cutoff_hz());
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Resonance"))
+                        .child(Button::new("syn-res-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_params.resonance = (this.synth_params.resonance - 0.05).max(0.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/synth/resonance", this.synth_params.resonance);
+                                }
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(52.0))
+                            .child(format!("{:.0}%", synth.resonance * 100.0)))
+                        .child(Button::new("syn-res-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_params.resonance = (this.synth_params.resonance + 0.05).min(1.0);
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_f32("/instrument/synth/resonance", this.synth_params.resonance);
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Attack"))
+                        .child(Button::new("syn-atk-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_params.attack = (this.synth_params.attack - 0.05).max(0.0);
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(52.0))
+                            .child(format!("{:.0}ms", synth.attack_ms())))
+                        .child(Button::new("syn-atk-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_params.attack = (this.synth_params.attack + 0.05).min(1.0);
+                                cx.notify();
+                            })))
+                )
+                .child(
+                    div().flex().items_center().gap_1().py(px(1.0))
+                        .child(div().text_xs().text_color(muted).w(px(72.0)).child("Sustain"))
+                        .child(Button::new("syn-sus-dn").label("−").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_params.sustain = (this.synth_params.sustain - 0.05).max(0.0);
+                                cx.notify();
+                            })))
+                        .child(div().text_xs().text_color(fg).w(px(52.0))
+                            .child(format!("{:.0}%", synth.sustain * 100.0)))
+                        .child(Button::new("syn-sus-up").label("+").small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.synth_params.sustain = (this.synth_params.sustain + 0.05).min(1.0);
+                                cx.notify();
+                            })))
+                )
+        };
+
+        // — PAD card —
+        let pad_card = {
+            let on = layers.pad_on;
+            div().flex().flex_col().p_3().min_w(px(160.0))
+                .border_1().border_color(if on { gpui::hsla(0.75,0.5,0.4,1.0) } else { bdr })
+                .rounded_md()
+                .child(
+                    div().flex().items_center().gap_2().mb(px(6.0))
+                        .child(div().w(px(8.0)).h(px(8.0)).rounded_full()
+                            .bg(if on { gpui::hsla(0.75,0.7,0.55,1.0) } else { gpui::hsla(0.0,0.0,0.3,1.0) }))
+                        .child(div().text_sm().font_weight(gpui::FontWeight::BOLD)
+                            .text_color(if on { fg } else { muted })
+                            .child("PAD"))
+                        .child(Button::new("pad-toggle").label(if on { "On" } else { "Off" }).small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.instrument_layers.toggle_pad();
+                                if let Some(ref s) = this.osc_loop.sender {
+                                    let _ = s.send_trigger("/instrument/pad/toggle");
+                                }
+                                cx.notify();
+                            })))
+                )
+                .child(div().text_xs().text_color(muted).mb(px(2.0))
+                    .child("Detuned chord pad, follows Tonnetz."))
+                .child(div().text_xs().text_color(muted)
+                    .child("Cue in for lush chordal texture."))
+        };
+
+        let modules_section = div().flex().flex_col().p_4().border_b_1().border_color(bdr)
+            .child(section_label("MODULES"))
+            .child(
+                div().flex().flex_row().gap_3().flex_wrap()
+                    .child(drums_card)
+                    .child(bass_card)
+                    .child(arp_card)
+                    .child(synth_card)
+                    .child(pad_card)
+            );
+
+        // ── SECTION 3: TONNETZ POSITION (larger, labelled) ────────────────
+        let mx = motion_x;
+        let my = motion_y;
+        let tonnetz_canvas = canvas(
+            move |bounds, _window, _cx| bounds,
+            move |bounds, _pb: Bounds<Pixels>, window, _cx| {
+                let w: f32 = bounds.size.width.into();
+                let h: f32 = bounds.size.height.into();
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+
+                // Background
+                window.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(ox), px(oy)), size: size(px(w), px(h)) },
+                    gpui::hsla(0.0, 0.0, 0.06, 1.0),
+                ));
+
+                // Grid lines (5×5)
+                for i in 1..5 {
+                    let xg = ox + w * i as f32 / 5.0;
+                    let yg = oy + h * i as f32 / 5.0;
+                    window.paint_quad(gpui::fill(
+                        Bounds { origin: point(px(xg), px(oy)), size: size(px(0.5), px(h)) },
+                        gpui::hsla(0.0, 0.0, 0.18, 1.0),
+                    ));
+                    window.paint_quad(gpui::fill(
+                        Bounds { origin: point(px(ox), px(yg)), size: size(px(w), px(0.5)) },
+                        gpui::hsla(0.0, 0.0, 0.18, 1.0),
+                    ));
+                }
+                // Centre crosshair (brighter)
+                window.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(ox), px(oy + h * 0.5 - 0.5)), size: size(px(w), px(1.0)) },
+                    gpui::hsla(0.0, 0.0, 0.30, 1.0),
+                ));
+                window.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(ox + w * 0.5 - 0.5), px(oy)), size: size(px(1.0), px(h)) },
+                    gpui::hsla(0.0, 0.0, 0.30, 1.0),
+                ));
+
+                // Dot glow + core
+                let dot_x = ox + (mx + 1.0) * 0.5 * w;
+                let dot_y = oy + (-my + 1.0) * 0.5 * h;
+                let r_glow = 18.0_f32;
+                window.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(dot_x - r_glow), px(dot_y - r_glow)),
+                              size: size(px(r_glow * 2.0), px(r_glow * 2.0)) },
+                    gpui::hsla(0.33, 0.8, 0.5, 0.18),
+                ));
+                let r_dot = 6.0_f32;
+                window.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(dot_x - r_dot), px(dot_y - r_dot)),
+                              size: size(px(r_dot * 2.0), px(r_dot * 2.0)) },
+                    gpui::hsla(0.33, 0.9, 0.65, 1.0),
+                ));
+            },
+        )
+        .w(px(280.0))
+        .h(px(180.0));
+
+        // Labelled Tonnetz with axis descriptions overlaid using positioned divs
+        let tonnetz_with_labels = div().relative().w(px(280.0)).h(px(180.0))
+            .child(tonnetz_canvas)
+            // Axis labels (absolute positioned over canvas)
+            .child(div().absolute().bottom(px(3.0)).left(px(4.0))
+                .text_xs().text_color(gpui::hsla(0.0,0.0,0.45,1.0)).child("← darker"))
+            .child(div().absolute().bottom(px(3.0)).right(px(4.0))
+                .text_xs().text_color(gpui::hsla(0.0,0.0,0.45,1.0)).child("brighter →"))
+            .child(div().absolute().top(px(3.0)).left_1_2().text_xs()
+                .text_color(gpui::hsla(0.0,0.0,0.45,1.0)).child("tense ↑"))
+            .child(div().absolute().bottom(px(14.0)).left_1_2().text_xs()
+                .text_color(gpui::hsla(0.0,0.0,0.45,1.0)).child("↓ relaxed"));
+
+        let tonnetz_section = div().flex().flex_col().p_4().border_b_1().border_color(bdr)
+            .child(section_label("TONNETZ POSITION"))
+            .child(div().text_xs().text_color(muted).mb(px(8.0))
+                .child("Brain α/β (left↔right) and θ (up↔down) steer the chord dot. The chord snaps every bar — or press ↻ to shift immediately."))
+            .child(
+                div().flex().items_center().gap_6()
+                    .child(tonnetz_with_labels)
+                    .child(
+                        div().flex().flex_col().gap_2()
+                            .child(div().flex().flex_col()
+                                .child(div().text_xs().text_color(muted).child("Current chord"))
+                                .child(div().text_lg().font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(fg).child(chord_label)))
+                            .child(
+                                // Manual chord shift — fires /instrument/tonnetz/shift
+                                Button::new("tonnetz-shift")
+                                    .label("↻  Shift Chord")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(ref s) = this.osc_loop.sender {
+                                            let _ = s.send_trigger("/instrument/tonnetz/shift");
+                                        }
+                                        cx.notify();
+                                    }))
+                            )
+                            .child(
+                                // Riser + impact — queued to fire at next bar boundary
+                                Button::new("riser-btn")
+                                    .label("▲  Riser")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(ref s) = this.osc_loop.sender {
+                                            let _ = s.send_trigger("/instrument/transition/riser");
+                                        }
+                                        cx.notify();
+                                    }))
+                            )
+                            .child(div().flex().flex_col()
+                                .child(div().text_xs().text_color(muted).child("Mode"))
+                                .child(div().text_sm().text_color(gpui::hsla(mode_hue, 0.7, 0.7, 1.0))
+                                    .child(mode.label())))
+                            .child(div().flex().flex_col()
+                                .child(div().text_xs().text_color(muted).child("Chord clock"))
+                                .child(div().text_xs().text_color(fg)
+                                    .child("snaps every 4 beats (1 bar)")))
+                            .child(div().flex().flex_col()
+                                .child(div().text_xs().text_color(muted).child("Horizontal"))
+                                .child(div().text_xs().text_color(fg)
+                                    .child("α asymmetry  darker ↔ brighter")))
+                            .child(div().flex().flex_col()
+                                .child(div().text_xs().text_color(muted).child("Vertical"))
+                                .child(div().text_xs().text_color(fg)
+                                    .child("θ power  relaxed ↔ tense")))
+                    )
+            );
+
+        // ── ASSEMBLE: outer Div wraps a scrollable inner Stateful<Div> ───
+        div().flex().flex_col().flex_1()
+            .child(
+                div()
+                    .id("instrument-scroll")
+                    .flex().flex_col().flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(mode_bar)
+                    .child(mapping_section)
+                    .child(modules_section)
+                    .child(self.render_instrument_visualizer(cx))
+                    .child(tonnetz_section)
+                    .child(self.render_sc_panel(cx))
+            )
+    }
+
+    fn render_instrument_visualizer(&mut self, cx: &mut Context<Self>) -> Div {
+        // ── Drum step patterns  [pattern][row][step] ──────────────────────────
+        // rows: 0=Kick  1=Snare  2=Hi-hat  3=Clap
+        const PATTERNS: [[[bool; 16]; 4]; 6] = [
+            // 0 – 4-on-floor
+            [
+                [true,false,false,false, true,false,false,false, true,false,false,false, true,false,false,false],
+                [false,false,false,false,true,false,false,false, false,false,false,false,true,false,false,false],
+                [true,false,true,false,  true,false,true,false,  true,false,true,false,  true,false,true,false ],
+                [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            ],
+            // 1 – Breakbeat
+            [
+                [true,false,false,true, false,false,true,false,  false,false,true,false,  false,true,false,false],
+                [false,false,false,false,true,false,false,false, false,false,false,false, true,false,false,false],
+                [true,true,false,true,  true,false,true,true,    false,true,true,false,   true,true,false,true  ],
+                [false,false,false,false,false,false,true,false, false,false,false,false, false,false,true,false],
+            ],
+            // 2 – Half-time (slow, heavy feel)
+            [
+                [true,false,false,false, false,false,false,false, true,false,false,true,  false,false,false,false],
+                [false,false,false,false,false,false,false,false, true,false,false,false, false,false,false,false],
+                [true,false,true,false,  true,false,true,false,  true,false,true,false,  true,false,true,false ],
+                [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            ],
+            // 3 – Trap (16th hihats, sparse kick+snare)
+            [
+                [true,false,false,false, false,false,false,false, true,false,false,false, false,false,false,false],
+                [false,false,false,false,false,false,false,false, true,false,false,false, false,false,false,false],
+                [true,true,true,true,   true,true,true,true,    true,true,true,true,    true,true,true,true  ],
+                [false,false,false,false,true,false,false,false, false,false,false,false, true,false,true,false ],
+            ],
+            // 4 – Dembow (Caribbean / reggaeton)
+            [
+                [true,false,false,false, true,false,false,false, true,false,false,false, false,false,false,false],
+                [false,false,false,false,false,false,true,false, false,false,false,false, false,false,true,false],
+                [true,false,true,false,  true,false,true,false,  true,false,true,false,  true,false,true,false ],
+                [false,false,false,false,true,false,false,false, false,false,false,false, true,false,false,false],
+            ],
+            // 5 – Samba
+            [
+                [true,false,false,true, false,false,true,false,  true,false,false,true,  false,false,true,false ],
+                [false,false,true,false, false,false,false,false, false,false,true,false, false,true,false,false ],
+                [true,false,true,false,  true,false,true,true,   true,false,true,false,  true,false,true,true   ],
+                [false,false,false,false,true,false,false,false, false,false,false,false, true,false,false,false],
+            ],
+        ];
+
+        // Row hues: Kick=green, Snare=blue, HiHat=cyan, Clap=pink
+        const ROW_HUES: [f32; 4] = [0.33, 0.60, 0.50, 0.95];
+
+        let bpm        = self.sc_params.bpm;
+        let morph      = self.synth_params.morph;
+        let wave_hue   = self.synth_params.wave_hue();
+        let pat_idx    = (self.drum_params.pattern as usize).min(5);
+        let drum_vol   = self.drum_params.volume;
+        let drums_on   = self.instrument_layers.drums_on;
+        // Per-instrument mute state for the canvas
+        let row_active = [
+            self.drum_params.kick_on,
+            self.drum_params.snare_on,
+            self.drum_params.hihat_on,
+            self.drum_params.clap_on,
+        ];
+        let bass_on    = self.instrument_layers.bass_on;
+        let bass_pat   = (self.bass_params.pattern as usize).min(4);
+        let bass_label = self.bass_params.pattern_label();
+        let synth_on   = self.synth_on;
+        let mode_hue   = self.instrument_mode.hue();
+        let mode_label = self.instrument_mode.label();
+
+        // Animated playhead: compute current 16th-note step from BPM and wall clock.
+        let elapsed_s  = self.instrument_clock.elapsed().as_secs_f32();
+        let step_dur_s = (60.0 / bpm) / 4.0;          // one 16th note in seconds
+        let cur_step   = if drums_on { ((elapsed_s / step_dur_s) as usize) % 16 } else { 16 }; // 16=none
+        let pattern    = PATTERNS[pat_idx];
+
+        let muted = cx.theme().muted_foreground;
+        let fg    = cx.theme().foreground;
+        let bdr   = cx.theme().border;
+
+        // ── DRUM CANVAS (440 × 160) ────────────────────────────────────────
+        let drum_canvas = canvas(
+            move |bounds, _win, _cx| bounds,
+            move |bounds, _pb: Bounds<Pixels>, win, _cx| {
+                let w: f32 = bounds.size.width.into();
+                let h: f32 = bounds.size.height.into();
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+
+                // Background
+                win.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(ox), px(oy)), size: size(px(w), px(h)) },
+                    gpui::hsla(0.0, 0.0, 0.04, 1.0),
+                ));
+
+                let rows = 4usize;
+                let cols = 16usize;
+                let pad  = 3.0_f32;
+                let cell_w = (w - pad * (cols as f32 + 1.0)) / cols as f32;
+                let cell_h = (h - pad * (rows as f32 + 1.0)) / rows as f32;
+
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let cx_pos = ox + pad + col as f32 * (cell_w + pad);
+                        let cy_pos = oy + pad + row as f32 * (cell_h + pad);
+                        let active = pattern[row][col];
+                        let is_now = col == cur_step && active;
+                        // Dim the whole row if that voice is muted
+                        let voice_on = row_active[row];
+
+                        // Base brightness: active step is lit, inactive is dark
+                        let lit = if !voice_on {
+                            0.06_f32 // muted row — very dark
+                        } else if is_now {
+                            0.90
+                        } else if active {
+                            0.40 + drum_vol * 0.20
+                        } else {
+                            0.09
+                        };
+                        let hue  = ROW_HUES[row];
+                        let sat  = if active && voice_on { 0.75_f32 } else { 0.10 };
+                        // Playhead column: highlight all cells in this column slightly
+                        let extra_lit = if col == cur_step && col < 16 && voice_on { 0.08 } else { 0.0 };
+
+                        win.paint_quad(gpui::fill(
+                            Bounds {
+                                origin: point(px(cx_pos), px(cy_pos)),
+                                size:   size(px(cell_w), px(cell_h)),
+                            },
+                            gpui::hsla(hue, sat, (lit + extra_lit).min(1.0), 1.0),
+                        ));
+                    }
+                }
+
+                // Beat-bar separators (every 4 steps)
+                for b in 1..4 {
+                    let x = ox + pad + b as f32 * 4.0 * (cell_w + pad) - pad * 0.5;
+                    win.paint_quad(gpui::fill(
+                        Bounds { origin: point(px(x), px(oy)), size: size(px(1.0), px(h)) },
+                        gpui::hsla(0.0, 0.0, 0.28, 1.0),
+                    ));
+                }
+            },
+        )
+        .w(px(440.0))
+        .h(px(160.0));
+
+        // ── BASS CANVAS (220 × 120) ──────────────────────────────────────────
+        // Mini piano-roll: 4 quarter-note columns, bar height = pitch height.
+        // 5 patterns × 4 steps (semitone offset from C2 root).
+        const BASS_PATS: [[i8; 4]; 5] = [
+            [ 0,  0,  0,  0],   // Root Pump
+            [ 0,  7,  5,  3],   // Walking
+            [ 0,-12,  7, -5],   // Octave Dive
+            [ 0,  3,  5,  7],   // Ascending
+            [ 0,  7, 12,  7],   // Bounce
+        ];
+        // Beat playhead: quarter-note timing
+        let beat_dur_s = 60.0 / bpm;
+        let cur_beat   = if bass_on { ((elapsed_s / beat_dur_s) as usize) % 4 } else { 4 };
+        let bass_canvas = canvas(
+            move |bounds, _win, _cx| bounds,
+            move |bounds, _pb: Bounds<Pixels>, win, _cx| {
+                let w: f32 = bounds.size.width.into();
+                let h: f32 = bounds.size.height.into();
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+
+                // Background
+                win.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(ox), px(oy)), size: size(px(w), px(h)) },
+                    gpui::hsla(0.0, 0.0, 0.04, 1.0),
+                ));
+
+                let pat  = &BASS_PATS[bass_pat];
+                let pad  = 4.0_f32;
+                let cols = 4usize;
+                let cell_w = (w - pad * (cols as f32 + 1.0)) / cols as f32;
+                // Pitch range for display: -12..+12 semitones (two octaves)
+                let pitch_min = -12.0_f32;
+                let pitch_max =  12.0_f32;
+                let pitch_span = pitch_max - pitch_min;
+
+                for col in 0..cols {
+                    let semitone  = pat[col] as f32;
+                    // normalise pitch to 0..1, then map to bar height (min 20% height)
+                    let norm      = ((semitone - pitch_min) / pitch_span).clamp(0.0, 1.0);
+                    let bar_h     = (norm * (h - pad * 2.0) * 0.85 + h * 0.12).min(h - pad);
+                    let bar_y     = oy + h - pad - bar_h;
+                    let bar_x     = ox + pad + col as f32 * (cell_w + pad);
+                    let is_now    = col == cur_beat;
+                    let active    = bass_on;
+
+                    // Column playhead glow
+                    if is_now {
+                        win.paint_quad(gpui::fill(
+                            Bounds {
+                                origin: point(px(bar_x - 1.0), px(oy)),
+                                size: size(px(cell_w + 2.0), px(h)),
+                            },
+                            gpui::hsla(0.60, 0.4, 0.15, 1.0),
+                        ));
+                    }
+
+                    let lit = if is_now { 0.80 } else if active { 0.50 } else { 0.25 };
+                    win.paint_quad(gpui::fill(
+                        Bounds {
+                            origin: point(px(bar_x), px(bar_y)),
+                            size:   size(px(cell_w), px(bar_h)),
+                        },
+                        gpui::hsla(0.60, if active { 0.75 } else { 0.15 }, lit, 1.0),
+                    ));
+
+                    // Semitone label at bottom
+                    let _label_y = oy + h - 12.0; // reserved for future text rendering
+                }
+
+                // Beat-bar separator
+                for b in 1..4 {
+                    let x = ox + pad + b as f32 * (cell_w + pad) - pad * 0.5;
+                    win.paint_quad(gpui::fill(
+                        Bounds { origin: point(px(x), px(oy)), size: size(px(1.0), px(h)) },
+                        gpui::hsla(0.0, 0.0, 0.22, 1.0),
+                    ));
+                }
+            },
+        )
+        .w(px(220.0))
+        .h(px(120.0));
+
+        // ── WAVEFORM CANVAS (260 × 160) ─────────────────────────────────────
+        let wave_canvas = canvas(
+            move |bounds, _win, _cx| bounds,
+            move |bounds, _pb: Bounds<Pixels>, win, _cx| {
+                let w: f32 = bounds.size.width.into();
+                let h: f32 = bounds.size.height.into();
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+                let mid_y = oy + h * 0.5;
+
+                // Background
+                win.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(ox), px(oy)), size: size(px(w), px(h)) },
+                    gpui::hsla(0.0, 0.0, 0.04, 1.0),
+                ));
+                // Zero line
+                win.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(ox), px(mid_y - 0.5)), size: size(px(w), px(1.0)) },
+                    gpui::hsla(0.0, 0.0, 0.25, 1.0),
+                ));
+
+                if !synth_on {
+                    // Grey flat line when synth is off
+                    win.paint_quad(gpui::fill(
+                        Bounds { origin: point(px(ox), px(mid_y - 0.5)), size: size(px(w), px(1.0)) },
+                        gpui::hsla(0.0, 0.0, 0.35, 1.0),
+                    ));
+                    return;
+                }
+
+                // Draw 2 cycles of the morphed waveform as filled columns
+                let n = w as usize;
+                for i in 0..n {
+                    let t = (i as f32 / n as f32) * 2.0; // 2 cycles
+                    let amp = sample_wave(t, morph);
+                    let col_h = (amp.abs() * h * 0.42).max(1.5);
+                    let col_y = if amp >= 0.0 { mid_y - col_h } else { mid_y };
+
+                    // Colour shifts from transparent (near zero) to full hue (at peak)
+                    let alpha = amp.abs() * 0.85 + 0.15;
+                    win.paint_quad(gpui::fill(
+                        Bounds {
+                            origin: point(px(ox + i as f32), px(col_y)),
+                            size:   size(px(1.0), px(col_h)),
+                        },
+                        gpui::hsla(wave_hue, 0.85, 0.60, alpha),
+                    ));
+                }
+            },
+        )
+        .w(px(260.0))
+        .h(px(160.0));
+
+        // ── MODE STATUS PANEL ──────────────────────────────────────────────
+        let mode_panel = div().flex().flex_col().gap_1().p_3()
+            .border_1().border_color(bdr).rounded_md().min_w(px(160.0))
+            .child(div().flex().items_center().gap_2()
+                .child(div().w(px(8.0)).h(px(8.0)).rounded_full()
+                    .bg(gpui::hsla(mode_hue, 0.7, 0.55, 1.0)))
+                .child(div().text_sm().font_weight(gpui::FontWeight::BOLD)
+                    .text_color(gpui::hsla(mode_hue, 0.7, 0.7, 1.0))
+                    .child(mode_label)))
+            .child(div().text_xs().text_color(muted).child(
+                if mode_hue > 0.3 {
+                    // ARRANGE (teal hue ~0.5)
+                    "Brain signals navigate chord space.\nJaw/blink cues layers in and out."
+                } else {
+                    // EDIT (amber hue ~0.11)
+                    "Signals sculpt the focused module.\nJaw cycles which module to edit."
+                }
+            ))
+            .child(div().mt(px(6.0)).text_xs().text_color(muted)
+                .child("jaw ×2 → switch mode"));
+
+        // ── ASSEMBLE VISUALIZER SECTION ────────────────────────────────────
+        div().flex().flex_col().p_4().border_b_1().border_color(bdr)
+            .child(
+                div().text_xs().font_weight(gpui::FontWeight::BOLD)
+                    .text_color(fg).mb(px(8.0))
+                    .child("VISUALIZER")
+            )
+            // Row 1: drums (wide) + bass (pitch bars) + mode panel
+            .child(
+                div().flex().flex_row().gap_4().items_start().mb(px(12.0))
+                    .child(
+                        div().flex().flex_col().gap_1()
+                            .child(div().text_xs().text_color(muted)
+                                .child(format!("DRUMS – {}  BPM {:.0}",
+                                    self.drum_params.pattern_label(), bpm)))
+                            .child(drum_canvas)
+                    )
+                    .child(
+                        div().flex().flex_col().gap_1()
+                            .child(div().text_xs().text_color(muted)
+                                .child(format!("BASS – {}", bass_label)))
+                            .child(bass_canvas)
+                    )
+                    .child(mode_panel)
+            )
+            // Row 2: waveform canvas (full width block)
+            .child(
+                div().flex().flex_col().gap_1()
+                    .child(div().text_xs().text_color(muted)
+                        .child(format!("SYNTH – wave {:.1}  ({})",
+                            morph, self.synth_params.wave_label())))
+                    .child(wave_canvas)
+            )
+    }
+
+    fn render_sc_panel(&mut self, cx: &mut Context<Self>) -> Div {
+        use instrument::sc_process::ScState;
+
+        let (sc_state, log_lines, meter_l, meter_r) = self
+            .sc_status
+            .lock()
+            .map(|s| (s.state.clone(), s.log_lines.clone(), s.meter_left, s.meter_right))
+            .unwrap_or_else(|_| (ScState::Stopped, Default::default(), 0.0, 0.0));
+
+        let is_running  = sc_state.is_running();
+        let state_label = sc_state.label().to_string();
+        let sc_params   = self.sc_params.clone();
+        let log_open    = self.sc_log_open;
+
+        let dot = match &sc_state {
+            ScState::Running  => "● ",
+            ScState::Stopped  => "○ ",
+            ScState::Error(_) => "✕ ",
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(290.0))
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            // Header
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{dot}SUPERCOLLIDER  {state_label}")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(if !is_running {
+                                Button::new("sc-start")
+                                    .label("▶ Start")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.sc_process.spawn("scripts/neural_synth.scd");
+                                        let host = "127.0.0.1".to_string();
+                                        this.osc_loop.connect(&host, 57120);
+                                        cx.notify();
+                                    }))
+                            } else {
+                                Button::new("sc-start").label("▶ Start").small()
+                            })
+                            .child(if is_running {
+                                Button::new("sc-stop")
+                                    .label("■ Stop")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.sc_process.kill();
+                                        cx.notify();
+                                    }))
+                            } else {
+                                Button::new("sc-stop").label("■ Stop").small()
+                            }),
+                    ),
+            )
+            // Master params
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("MASTER"),
+                    )
+                    .child(sc_param_row("vol",  "Volume", sc_params.master_volume, 0.0,   1.0,   0.05, "/sc/master/volume",  cx))
+                    .child(sc_param_row("rev",  "Reverb", sc_params.reverb,        0.0,   1.0,   0.05, "/sc/master/reverb",  cx))
+                    .child(sc_param_row("bpm",  "BPM",    sc_params.bpm,           60.0,  200.0, 1.0,  "/sc/rhythm/bpm",     cx))
+                    .child(sc_param_row("tune", "Tuning", sc_params.tuning,        430.0, 460.0, 0.5,  "/sc/master/tuning",  cx)),
+            )
+            // Audio metering
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("LEVEL"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("L"))
+                            .child(self.render_signal_bar(meter_l, meter_l, cx))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{:.0}dB", linear_to_db(meter_l))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("R"))
+                            .child(self.render_signal_bar(meter_r, meter_r, cx))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{:.0}dB", linear_to_db(meter_r))),
+                            ),
+                    ),
+            )
+            // SC log
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("SC LOG"),
+                            )
+                            .child(
+                                Button::new("sc-log-toggle")
+                                    .label(if log_open { "▲" } else { "▼" })
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.sc_log_open = !this.sc_log_open;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .children(if log_open {
+                        log_lines.iter().rev().take(10).rev().map(|line| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(line.clone())
+                        }).collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    }),
+            )
+    }
+
+    /// Horizontal signal bar: background track + filled portion.
+    fn render_signal_bar(&self, raw: f32, smoothed: f32, _cx: &mut Context<Self>) -> impl IntoElement {
+        let raw_pct    = raw.clamp(0.0, 1.0);
+        let smooth_pct = smoothed.clamp(0.0, 1.0);
+        canvas(
+            move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| bounds,
+            move |bounds, _pb: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
+                let w: f32 = bounds.size.width.into();
+                let h: f32 = bounds.size.height.into();
+                let x: f32 = bounds.origin.x.into();
+                let y: f32 = bounds.origin.y.into();
+                window.paint_quad(gpui::fill(
+                    Bounds { origin: point(px(x), px(y + h * 0.25)), size: size(px(w), px(h * 0.5)) },
+                    gpui::hsla(0.0, 0.0, 0.2, 1.0),
+                ));
+                if raw_pct > 0.001 {
+                    window.paint_quad(gpui::fill(
+                        Bounds { origin: point(px(x), px(y + h * 0.25)), size: size(px(w * raw_pct), px(h * 0.5)) },
+                        gpui::hsla(0.6, 0.6, 0.4, 0.5),
+                    ));
+                }
+                if smooth_pct > 0.001 {
+                    window.paint_quad(gpui::fill(
+                        Bounds { origin: point(px(x), px(y + h * 0.3)), size: size(px(w * smooth_pct), px(h * 0.4)) },
+                        gpui::hsla(0.6, 0.9, 0.6, 1.0),
+                    ));
+                }
+            },
+        )
+        .w_full()
+        .h(px(16.0))
+    }
+
     // ── Calibration ─────────────────────────────────────────────────────────
 
     fn render_calibration_view(&mut self, cx: &mut Context<Self>) -> Div {
@@ -5498,6 +7603,10 @@ impl MindDaw {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 match recorder::storage::load_baseline_profile(&n) {
                                     Ok(bl) => {
+                                        // Wire baseline into LiveProcessor so signal bars
+                                        // are normalised relative to your calibration data.
+                                        this.live_processor.set_baseline(&bl.mean_band_powers);
+                                        eprintln!("[profiles] wired '{}' into LiveProcessor baseline", n);
                                         this.rec.baseline = Some(bl);
                                         this.rec.baseline_dashboard_open = true;
                                         eprintln!("[profiles] loaded '{n}'");
@@ -6126,6 +8235,96 @@ fn pca_sphere_canvas(
     )
     .w_full()
     .h(px(400.0))
+}
+
+/// Convert a linear amplitude (0–1) to dBFS.
+/// Sample a morphed waveform at position `t` (0.0–1.0 = one full cycle).
+/// `morph` ranges 0.0 (sine) → 1.0 (triangle) → 2.0 (saw) → 3.0 (square).
+/// Fractional values smoothly crossfade adjacent waveforms.
+fn sample_wave(t: f32, morph: f32) -> f32 {
+    let tau = std::f32::consts::TAU;
+    let t = t.rem_euclid(1.0);
+    let sine     = (t * tau).sin();
+    let triangle = if t < 0.25 { 4.0 * t }
+                   else if t < 0.75 { 2.0 - 4.0 * t }
+                   else { 4.0 * t - 4.0 };
+    let saw      = 1.0 - 2.0 * t;
+    let square   = if t < 0.5 { 1.0_f32 } else { -1.0 };
+    let waves    = [sine, triangle, saw, square];
+    let idx  = morph.clamp(0.0, 2.999).floor() as usize;
+    let frac = morph.fract();
+    waves[idx] * (1.0 - frac) + waves[idx + 1] * frac
+}
+
+fn linear_to_db(linear: f32) -> f32 {
+    20.0 * linear.max(1e-6).log10()
+}
+
+/// Render a single SC master-parameter row with − value + buttons.
+fn sc_param_row(
+    id: &'static str,
+    label: &'static str,
+    value: f32,
+    min: f32,
+    max: f32,
+    step: f32,
+    osc_addr: &'static str,
+    cx: &mut Context<MindDaw>,
+) -> impl IntoElement {
+    let fmt = if id == "bpm" {
+        format!("{:.0}", value)
+    } else if id == "tune" {
+        format!("{:.1}Hz", value)
+    } else {
+        format!("{:.2}", value)
+    };
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .py_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .w(px(52.0))
+                .child(label),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new(SharedString::from(format!("{id}-dec")))
+                        .label("−")
+                        .small()
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            let cur = this.sc_params.by_id(id);
+                            let new_val = (cur - step).clamp(min, max);
+                            this.sc_params.set_by_id(id, new_val);
+                            if let Some(ref sender) = this.osc_loop.sender {
+                                let _ = sender.send_f32(osc_addr, new_val);
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(div().text_xs().w(px(44.0)).child(fmt))
+                .child(
+                    Button::new(SharedString::from(format!("{id}-inc")))
+                        .label("+")
+                        .small()
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            let cur = this.sc_params.by_id(id);
+                            let new_val = (cur + step).clamp(min, max);
+                            this.sc_params.set_by_id(id, new_val);
+                            if let Some(ref sender) = this.osc_loop.sender {
+                                let _ = sender.send_f32(osc_addr, new_val);
+                            }
+                            cx.notify();
+                        })),
+                ),
+        )
 }
 
 fn main() {

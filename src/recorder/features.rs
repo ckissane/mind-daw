@@ -10,6 +10,14 @@ pub const BLINK_CHANNELS: [usize; 2] = [0, 1];
 pub const JAW_CHANNELS: [usize; 4] = [10, 11, 22, 23];
 /// Central channels (C3/C4 area) for motor imagery.
 pub const MOTOR_CHANNELS: [usize; 4] = [20, 21, 30, 31];
+/// Left frontal channel (F3) for alpha/beta asymmetry.
+pub const LEFT_FRONTAL_CHANNEL: usize = 5;
+/// Right frontal channel (F4) for alpha/beta asymmetry.
+pub const RIGHT_FRONTAL_CHANNEL: usize = 7;
+/// Frontal midline channel (Fz) for theta power.
+pub const FZ_CHANNEL: usize = 6;
+/// Central midline channel (Cz) for beta power.
+pub const CZ_CHANNEL: usize = 16;
 
 // ── Band definitions (Hz) ─────────────────────────────────────────────────────
 
