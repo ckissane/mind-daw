@@ -2,6 +2,7 @@ pub mod auto_detect;
 pub mod baseline;
 pub mod classifier;
 pub mod epoch;
+pub mod fbcsp;
 pub mod features;
 pub mod storage;
 

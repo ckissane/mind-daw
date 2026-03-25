@@ -321,7 +321,7 @@ impl BaselineRecorder {
             let bin_hz = self.sample_rate / FFT_SIZE as f32;
             let lo = (8.0_f32 / bin_hz).ceil() as usize;
             let hi = ((13.0_f32 / bin_hz).floor() as usize).min(FFT_SIZE / 2 - 1);
-            let occ = [59usize, 60, 61]; // O1, POOz, O2
+            let occ = crate::cognionics::OCCIPITAL_CHANNELS;
             let mut avg = vec![0.0f64; FFT_SIZE / 2];
             for &ch in &occ {
                 if ch < self.spectrum_sums.len() {
