@@ -5,6 +5,10 @@ use std::sync::mpsc;
 pub const NUM_CHANNELS: usize = 64;
 pub const SAMPLE_RATE: f64 = 300.0;
 pub const PACKET_SIZE: usize = 195;
+
+/// HD-72 occipital electrode indices: O1 (ch 59), POOz/Oz (ch 60), O2 (ch 61).
+/// Used for Individual Alpha Frequency (IAF) detection.
+pub const OCCIPITAL_CHANNELS: [usize; 3] = [59, 60, 61];
 const SYNC_BYTE: u8 = 0xFF;
 const IMPEDANCE_OFF_CMD: u8 = 0x12;
 

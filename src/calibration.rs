@@ -9,11 +9,18 @@
 //!
 //! Returning users get a quick refresh flow instead of full recalibration.
 
+use crate::recorder::fbcsp::{FbcspModel, FbcspTrial};
+use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Sample rate of the Cognionics headset (and default for calibration math).
 const SAMPLE_RATE: f32 = crate::cognionics::SAMPLE_RATE as f32;
+
+/// High-pass filter coefficient for 0.5 Hz cutoff at 300 Hz sample rate.
+/// α = 1 / (1 + 2π·fc/fs) ≈ 0.9895
+const HP_ALPHA: f32 = 0.989_5;
 
 // ── Calibration profile ──────────────────────────────────────────────────────
 
@@ -52,7 +59,6 @@ pub struct CalibrationProfile {
 
     // ── artifact templates ───────────────────────────────────────────
     pub blink_amplitude: f32,
-    pub double_blink_interval: f32,
     pub jaw_clench_amplitude: f32,
 
     // ── expression anchors ───────────────────────────────────────────
@@ -60,6 +66,11 @@ pub struct CalibrationProfile {
     pub expression_relaxed: BandPowers,
     /// Band powers during focused-attention condition.
     pub expression_focused: BandPowers,
+
+    // ── trained classifier ────────────────────────────────────────────
+    /// FBCSP model trained during action calibration (if any).
+    #[serde(default)]
+    pub trained_model: Option<FbcspModel>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -159,7 +170,9 @@ pub enum CalibrationStep {
     ExpressionRelaxed,
     /// 4b. Expression calibration — focused attention.
     ExpressionFocused,
-    /// 5. Musical sandbox — user explores the instrument.
+    /// 5. Action training — cued trials for FBCSP classifier (user-controlled duration).
+    ActionTraining,
+    /// 6. Musical sandbox — user explores the instrument.
     Sandbox,
     /// Done.
     Complete,
@@ -176,7 +189,8 @@ impl CalibrationStep {
             Self::ArtifactJawClench => "5/8  Jaw clench recording",
             Self::ExpressionRelaxed => "6/8  Relaxed gaze",
             Self::ExpressionFocused => "7/8  Focused attention",
-            Self::Sandbox           => "8/8  Musical sandbox",
+            Self::ActionTraining    => "8/8  Action training",
+            Self::Sandbox           => "Sandbox",
             Self::Complete          => "Calibration complete",
         }
     }
@@ -191,6 +205,7 @@ impl CalibrationStep {
             Self::ArtifactJawClench => "Clench your jaw firmly 3 times, pausing ~2 s between each.",
             Self::ExpressionRelaxed => "Relax completely. Soft gaze, calm breathing.",
             Self::ExpressionFocused => "Focus intently on the center of the screen. Count backwards from 100 by 7.",
+            Self::ActionTraining    => "Follow the cues to train the classifier. REST between each action.",
             Self::Sandbox           => "Explore the harmonic space! Move around the orbifold with your brain.",
             Self::Complete          => "Calibration complete. Profile saved.",
         }
@@ -205,6 +220,7 @@ impl CalibrationStep {
             Self::ArtifactJawClench => 10.0,
             Self::ExpressionRelaxed => 30.0,
             Self::ExpressionFocused => 30.0,
+            Self::ActionTraining    => 0.0, // user-controlled
             Self::Sandbox           => 60.0,
             _ => 0.0,
         }
@@ -219,8 +235,9 @@ impl CalibrationStep {
             Self::ArtifactBlink     => Self::ArtifactJawClench,
             Self::ArtifactJawClench => Self::ExpressionRelaxed,
             Self::ExpressionRelaxed => Self::ExpressionFocused,
-            Self::ExpressionFocused => Self::Sandbox,
-            Self::Sandbox           => Self::Complete,
+            Self::ExpressionFocused => Self::ActionTraining,
+            Self::ActionTraining    => Self::Complete,
+            Self::Sandbox           => Self::Complete, // kept for refresh flow
             Self::Complete          => Self::Complete,
         }
     }
@@ -268,6 +285,97 @@ pub struct ChannelDiag {
     pub flat: bool,
 }
 
+// ── Action training state ────────────────────────────────────────────────────
+
+/// Duration constants for the cued-trial protocol.
+const REST_CUE_SECS: f32 = 2.0;
+const ACTION_CUE_SECS: f32 = 3.0;
+
+/// Default actions available for training.
+pub const TRAINABLE_ACTIONS: &[&str] = &[
+    "blink",
+    "jaw_clench",
+    "motor_left_hand",
+    "motor_right_hand",
+    "eyes_closed",
+    "eyes_open",
+];
+
+/// State for the cued-trial action training protocol.
+pub struct ActionTrainingState {
+    /// Which actions the user selected for training.
+    pub selected_actions: Vec<String>,
+    /// Collected FBCSP trials.
+    pub trials: Vec<FbcspTrial>,
+    /// Trial count per label.
+    pub trial_counts: HashMap<String, usize>,
+    /// Index into `selected_actions` for the current round-robin action.
+    pub current_action_idx: usize,
+    /// true = action cue phase, false = rest cue phase.
+    pub is_action_phase: bool,
+    /// Seconds elapsed within the current cue.
+    pub cue_elapsed: f32,
+    /// Total trials completed.
+    pub total_trials: usize,
+    /// Whether training has been run on current data.
+    pub model_trained: bool,
+    /// The trained FBCSP model (if any).
+    pub trained_model: Option<FbcspModel>,
+    /// Whether the protocol is actively running (cues cycling).
+    pub running: bool,
+}
+
+impl Default for ActionTrainingState {
+    fn default() -> Self {
+        Self {
+            selected_actions: Vec::new(),
+            trials: Vec::new(),
+            trial_counts: HashMap::new(),
+            current_action_idx: 0,
+            is_action_phase: false,
+            cue_elapsed: 0.0,
+            total_trials: 0,
+            model_trained: false,
+            trained_model: None,
+            running: false,
+        }
+    }
+}
+
+impl ActionTrainingState {
+    /// The label of the current cue ("rest" or the action name).
+    pub fn current_cue(&self) -> &str {
+        if !self.running {
+            return "ready";
+        }
+        if !self.is_action_phase {
+            "rest"
+        } else if let Some(action) = self.selected_actions.get(self.current_action_idx) {
+            action.as_str()
+        } else {
+            "rest"
+        }
+    }
+
+    /// Duration of the current cue phase.
+    pub fn current_cue_duration(&self) -> f32 {
+        if self.is_action_phase { ACTION_CUE_SECS } else { REST_CUE_SECS }
+    }
+
+    /// Progress within the current cue (0.0–1.0).
+    pub fn cue_progress(&self) -> f32 {
+        let dur = self.current_cue_duration();
+        if dur <= 0.0 { 0.0 } else { (self.cue_elapsed / dur).min(1.0) }
+    }
+
+    /// Whether enough trials have been collected for FBCSP training.
+    pub fn can_train(&self) -> bool {
+        let min = crate::recorder::fbcsp::MIN_EPOCHS;
+        self.trial_counts.len() >= 2
+            && self.trial_counts.values().all(|&c| c >= min)
+    }
+}
+
 // ── Calibration state ────────────────────────────────────────────────────────
 
 pub struct CalibrationState {
@@ -285,6 +393,9 @@ pub struct CalibrationState {
     sample_buf: Vec<Vec<f32>>,
     /// Counter for deduplicating `feed_buffer` calls.
     last_buf_hash: u64,
+    /// 1st-order IIR high-pass filter state: (prev_input, prev_output) per channel.
+    /// Cutoff ≈ 0.5 Hz — removes DC drift without distorting EEG bands.
+    hp_state: Vec<(f32, f32)>,
 
     // Intermediate results carried between steps
     means_open: Vec<f32>,
@@ -310,6 +421,9 @@ pub struct CalibrationState {
     pub warnings: Vec<String>,
 
     pub available_profiles: Vec<String>,
+
+    /// Cued-trial action training state.
+    pub action_training: ActionTrainingState,
 }
 
 impl CalibrationState {
@@ -324,6 +438,7 @@ impl CalibrationState {
             num_channels,
             sample_buf: vec![Vec::new(); num_channels],
             last_buf_hash: 0,
+            hp_state: vec![(0.0, 0.0); num_channels],
             means_open: vec![0.0; num_channels],
             stds_open: vec![0.0; num_channels],
             means_closed: vec![0.0; num_channels],
@@ -342,6 +457,7 @@ impl CalibrationState {
             channel_diag: vec![ChannelDiag::default(); num_channels],
             warnings: Vec::new(),
             available_profiles: CalibrationProfile::list_profiles(),
+            action_training: ActionTrainingState::default(),
         }
     }
 
@@ -390,7 +506,12 @@ impl CalibrationState {
             let take = buf.len().min(new_per_frame);
             let start = buf.len().saturating_sub(take);
             for i in start..buf.len() {
-                self.sample_buf[ch].push(buf[i]);
+                // Apply 0.5 Hz high-pass IIR to remove DC drift
+                let x = buf[i];
+                let (prev_in, prev_out) = self.hp_state[ch];
+                let y = HP_ALPHA * (prev_out + x - prev_in);
+                self.hp_state[ch] = (x, y);
+                self.sample_buf[ch].push(y);
             }
         }
 
@@ -427,7 +548,11 @@ impl CalibrationState {
             let take = d.len().min(new_per_frame);
             let start = d.len().saturating_sub(take);
             for &v in &d[start..] {
-                self.sample_buf[ch].push(v);
+                // Apply 0.5 Hz high-pass IIR to remove DC drift
+                let (prev_in, prev_out) = self.hp_state[ch];
+                let y = HP_ALPHA * (prev_out + v - prev_in);
+                self.hp_state[ch] = (v, y);
+                self.sample_buf[ch].push(y);
             }
         }
 
@@ -469,6 +594,132 @@ impl CalibrationState {
         self.channel_diag.iter().filter(|d| d.quality > 0.3).count()
     }
 
+    // ── Action training protocol ─────────────────────────────────────
+
+    /// Begin the cued-trial protocol with the given action labels.
+    pub fn start_action_training(&mut self, actions: Vec<String>) {
+        self.action_training = ActionTrainingState {
+            selected_actions: actions,
+            running: true,
+            ..Default::default()
+        };
+        self.clear_samples();
+    }
+
+    /// Feed EEG data during action training.  Manages the REST → ACTION cue
+    /// cycle and automatically segments completed action phases as trials.
+    pub fn feed_action_training(
+        &mut self,
+        raw_bufs: &[std::collections::VecDeque<f32>],
+        dt: f32,
+    ) {
+        if self.step != CalibrationStep::ActionTraining || !self.action_training.running {
+            return;
+        }
+
+        self.action_training.cue_elapsed += dt;
+
+        // Ingest new samples (same HP-filtered path as feed_raw_bufs)
+        let new_per_frame = (SAMPLE_RATE / 30.0).ceil() as usize;
+        let n_ch = raw_bufs.len().min(self.num_channels);
+        for ch in 0..n_ch {
+            let buf = &raw_bufs[ch];
+            let take = buf.len().min(new_per_frame);
+            let start = buf.len().saturating_sub(take);
+            for i in start..buf.len() {
+                let x = buf[i];
+                let (prev_in, prev_out) = self.hp_state[ch];
+                let y = HP_ALPHA * (prev_out + x - prev_in);
+                self.hp_state[ch] = (x, y);
+                self.sample_buf[ch].push(y);
+            }
+        }
+
+        // Phase transitions
+        if !self.action_training.is_action_phase {
+            // REST phase
+            if self.action_training.cue_elapsed >= REST_CUE_SECS {
+                self.action_training.is_action_phase = true;
+                self.action_training.cue_elapsed = 0.0;
+                self.clear_samples(); // fresh buffer for the action epoch
+            }
+        } else {
+            // ACTION phase
+            if self.action_training.cue_elapsed >= ACTION_CUE_SECS {
+                // Segment the buffered samples into an FbcspTrial
+                let label = self.action_training.selected_actions
+                    [self.action_training.current_action_idx]
+                    .clone();
+                self.segment_and_store_trial(&label);
+
+                // Round-robin to next action
+                self.action_training.current_action_idx = (self.action_training.current_action_idx
+                    + 1)
+                    % self.action_training.selected_actions.len();
+                self.action_training.is_action_phase = false;
+                self.action_training.cue_elapsed = 0.0;
+                self.action_training.model_trained = false; // stale
+                self.clear_samples();
+            }
+        }
+    }
+
+    fn segment_and_store_trial(&mut self, label: &str) {
+        let min_samples = (SAMPLE_RATE * 1.0) as usize;
+        if self.sample_buf[0].len() < min_samples {
+            return;
+        }
+        let channels: Vec<Vec<f32>> = self.sample_buf.iter().map(|ch| ch.clone()).collect();
+        let trial = FbcspTrial {
+            channels,
+            label: label.to_string(),
+        };
+        self.action_training.trials.push(trial);
+        *self
+            .action_training
+            .trial_counts
+            .entry(label.to_string())
+            .or_insert(0) += 1;
+        self.action_training.total_trials += 1;
+    }
+
+    /// Train FBCSP on collected action training trials.
+    #[allow(dead_code)]
+    pub fn train_action_fbcsp(&mut self) {
+        match FbcspModel::train(&self.action_training.trials, SAMPLE_RATE) {
+            Some(model) => {
+                eprintln!(
+                    "[calibration] FBCSP trained: {} classes, {} features",
+                    model.labels.len(),
+                    model.n_features()
+                );
+                self.action_training.trained_model = Some(model);
+                self.action_training.model_trained = true;
+            }
+            None => {
+                eprintln!("[calibration] FBCSP training failed (not enough data?)");
+            }
+        }
+    }
+
+    /// Finish action training, build and save profile, advance to Complete.
+    pub fn finish_action_training(&mut self) {
+        self.action_training.running = false;
+        self.build_and_save_profile();
+        self.step = CalibrationStep::Complete;
+        self.elapsed_secs = 0.0;
+        self.clear_samples();
+    }
+
+    /// Skip action training, build and save profile, advance to Complete.
+    pub fn skip_action_training(&mut self) {
+        self.action_training.running = false;
+        self.build_and_save_profile();
+        self.step = CalibrationStep::Complete;
+        self.elapsed_secs = 0.0;
+        self.clear_samples();
+    }
+
     // ── internals ────────────────────────────────────────────────────
 
     fn is_active(&self) -> bool {
@@ -488,6 +739,10 @@ impl CalibrationState {
     }
 
     fn check_step_done(&mut self) {
+        // ActionTraining is user-controlled — not time-bounded.
+        if self.step == CalibrationStep::ActionTraining {
+            return;
+        }
         if self.elapsed_secs >= self.current_duration() && self.current_duration() > 0.0 {
             self.finalize_step();
         }
@@ -498,6 +753,9 @@ impl CalibrationState {
             buf.clear();
         }
         self.last_buf_hash = 0;
+        for s in &mut self.hp_state {
+            *s = (0.0, 0.0);
+        }
     }
 
     fn finalize_step(&mut self) {
@@ -543,9 +801,11 @@ impl CalibrationState {
                 CalibrationStep::ExpressionRelaxed => self.compute_expression(true),
                 CalibrationStep::ExpressionFocused => {
                     self.compute_expression(false);
+                }
+                CalibrationStep::ActionTraining => { /* user-controlled, unreachable */ }
+                CalibrationStep::Sandbox => {
                     self.build_and_save_profile();
                 }
-                CalibrationStep::Sandbox => { /* just runs */ }
                 _ => {}
             }
             self.step = self.step.next();
@@ -800,13 +1060,16 @@ impl CalibrationState {
         let alpha_lo = (7.0 / bin_hz).ceil() as usize;
         let alpha_hi = (14.0 / bin_hz).floor() as usize;
 
-        // Average power spectrum across good posterior channels
+        // Average power spectrum across good occipital channels (O1, POOz, O2)
+        use crate::cognionics::OCCIPITAL_CHANNELS;
         let posterior: Vec<usize> = if self.good_channels.is_empty() {
-            (0..self.num_channels.min(8)).collect()
+            OCCIPITAL_CHANNELS.iter().copied()
+                .filter(|&c| c < self.num_channels).collect()
         } else {
-            // Prefer posterior channels (roughly ch 24-40 on HD-72)
             let post: Vec<usize> = self.good_channels.iter()
-                .copied().filter(|&c| c >= 20).take(8).collect();
+                .copied()
+                .filter(|c| OCCIPITAL_CHANNELS.contains(c))
+                .collect();
             if post.is_empty() { self.good_channels.iter().copied().take(8).collect() }
             else { post }
         };
@@ -932,10 +1195,10 @@ impl CalibrationState {
             alpha_peak_hz: self.alpha_peak,
             alpha_range: self.alpha_range,
             blink_amplitude: self.blink_amplitude,
-            double_blink_interval: 0.3,
             jaw_clench_amplitude: self.jaw_clench_amplitude,
             expression_relaxed: self.expr_relaxed.clone(),
             expression_focused: self.expr_focused.clone(),
+            trained_model: self.action_training.trained_model.clone(),
         };
 
         match profile.save() {
@@ -957,22 +1220,21 @@ fn quick_hash(bufs: &[std::collections::VecDeque<f32>]) -> u64 {
         .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b))
 }
 
-/// Hann-windowed power spectrum (bins 1..N/2).
+/// Hann-windowed power spectrum (bins 0..N/2) using rustfft.
 fn windowed_power_spectrum(samples: &[f32], fft_size: usize) -> Vec<f32> {
-    let pi2 = 2.0 * std::f32::consts::PI;
     let n = fft_size as f32;
+    let mut buf: Vec<Complex<f32>> = vec![Complex::default(); fft_size];
+    for (i, &x) in samples.iter().enumerate().take(fft_size) {
+        // Hann window: sin²(πi/N) ≡ 0.5(1 − cos(2πi/N))
+        let w = (std::f32::consts::PI * i as f32 / n).sin().powi(2);
+        buf[i] = Complex::new(x * w, 0.0);
+    }
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(fft_size);
+    fft.process(&mut buf);
     let mut power = vec![0.0f32; fft_size / 2];
-
     for k in 1..fft_size / 2 {
-        let mut re = 0.0f32;
-        let mut im = 0.0f32;
-        for (i, &x) in samples.iter().enumerate().take(fft_size) {
-            let hann = 0.5 * (1.0 - (pi2 * i as f32 / n).cos());
-            let angle = pi2 * k as f32 * i as f32 / n;
-            re += x * hann * angle.cos();
-            im -= x * hann * angle.sin();
-        }
-        power[k] = (re * re + im * im) / (n * n);
+        power[k] = buf[k].norm_sqr() / (n * n);
     }
     power
 }
@@ -983,26 +1245,14 @@ fn estimate_line_noise(data: &[f32], sample_rate: f32) -> f32 {
     if fft_size < 128 { return 0.0; }
 
     let window = &data[data.len() - fft_size..];
+    let power = windowed_power_spectrum(window, fft_size);
     let bin_hz = sample_rate / fft_size as f32;
-    let pi2 = 2.0 * std::f32::consts::PI;
-    let n = fft_size as f32;
 
-    // Compute power at 50 Hz and 60 Hz (± 1 bin)
     let mut line_power = 0.0f32;
     let mut total_power = 0.0f32;
 
-    for k in 1..fft_size / 2 {
-        let mut re = 0.0f32;
-        let mut im = 0.0f32;
-        for (i, &x) in window.iter().enumerate().take(fft_size) {
-            let hann = 0.5 * (1.0 - (pi2 * i as f32 / n).cos());
-            let angle = pi2 * k as f32 * i as f32 / n;
-            re += x * hann * angle.cos();
-            im -= x * hann * angle.sin();
-        }
-        let p = (re * re + im * im) / (n * n);
+    for (k, &p) in power.iter().enumerate().skip(1) {
         total_power += p;
-
         let freq = k as f32 * bin_hz;
         if (freq - 50.0).abs() < bin_hz * 1.5 || (freq - 60.0).abs() < bin_hz * 1.5 {
             line_power += p;

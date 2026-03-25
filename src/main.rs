@@ -2,6 +2,8 @@ mod audio;
 mod calibration;
 mod cognionics;
 mod control;
+#[allow(dead_code)]
+mod sc;
 mod session_log;
 mod recorder;
 mod soundboard;
@@ -17,6 +19,7 @@ use recorder::auto_detect::detect_event;
 use recorder::baseline::{BaselineProfile, BaselineRecorder, BAND_HUES, BAND_NAMES, BAND_SYMS, REGION_NAMES};
 use recorder::baseline::normalize_features as baseline_normalize;
 use recorder::classifier::{predict_features, TrainedClassifier, MIN_EPOCHS_PER_CLASS, RETRAIN_EVERY};
+use recorder::fbcsp::{FbcspModel, FbcspTrial};
 use recorder::features::extract_features;
 use recorder::{AutoDetectThresholds, ClassifierPrediction, RecordingSession, StimulusEpoch};
 use word_read::WordReadState;
@@ -89,6 +92,7 @@ struct RecorderUiState {
     /// Epoch loaded from the library for review (cleared when Record/ARM pressed or "Live" clicked).
     review_epoch: Option<StimulusEpoch>,
     classifier: Option<TrainedClassifier>,
+    fbcsp_model: Option<FbcspModel>,
     last_prediction: Option<ClassifierPrediction>,
     prediction_history: VecDeque<ClassifierPrediction>,
     thresholds: AutoDetectThresholds,
@@ -119,6 +123,7 @@ impl Default for RecorderUiState {
             pending_epoch: None,
             review_epoch: None,
             classifier: None,
+            fbcsp_model: None,
             last_prediction: None,
             prediction_history: VecDeque::with_capacity(10),
             thresholds: AutoDetectThresholds::default(),
@@ -206,9 +211,9 @@ impl BrainWaveBand {
         let bin_hz = SPECTRUM_SAMPLE_RATE / SPECTRUM_FFT_SIZE as f32;
         // compute_spectrum output[i] corresponds to bin (i+1), freq = (i+1)*bin_hz
         let start = ((lo_hz / bin_hz).ceil() as usize).saturating_sub(1);
-        let end = (hi_hz / bin_hz).floor() as usize; // inclusive bin index, but we use it as exclusive slice end
-        let max_bin = SPECTRUM_FFT_SIZE / 2 - 1; // max output index
-        (start.min(max_bin), end.min(max_bin + 1))
+        let end = (hi_hz / bin_hz).floor() as usize;
+        let max_len = SPECTRUM_FFT_SIZE / 2 - 1; // compute_spectrum returns buf[1..N/2], length = N/2 - 1
+        (start.min(max_len), end.min(max_len))
     }
 
     fn hue(self) -> f32 {
@@ -258,12 +263,18 @@ struct MindDaw {
 
     // Soundboard
     soundboard_handle: Option<soundboard::SoundboardHandle>,
+    sc_handle: Option<sc::ScHandle>,
+    sc_voice: sc::Voice,
+    sc_params: sc::ChordParams,
+    sc_profiles: Vec<sc::SoundProfile>,
+    sc_active_profile: Option<usize>,
     sb: SoundboardUiState,
 
     // Tonnetz / Orbifold
     tonnetz_state: tonnetz::TonnetzState,
     prev_tonnetz_chord_idx: usize,
     tonnetz_muted: bool,
+    tonnetz_manual_nav: bool,
 
     // Calibration & Control
     calibration_state: CalibrationState,
@@ -281,6 +292,8 @@ struct MindDaw {
     detecting_jaw_clench: bool,
     /// Band power snapshot for display.
     live_band_powers: calibration::BandPowers,
+    /// Last time an action-driven navigation fired (for debouncing).
+    last_action_nav: std::time::Instant,
 
     // Recorder
     rec_ring: VecDeque<[f32; 64]>,
@@ -294,6 +307,89 @@ struct MindDaw {
 }
 
 const COG_BUFFER_CAPACITY: usize = 150;
+
+// ── Palette ──────────────────────────────────────────────────────────────────
+
+fn c_bg() -> Hsla      { hsla(0.62, 0.20, 0.06, 1.0) }
+fn c_surface() -> Hsla  { hsla(0.62, 0.15, 0.09, 1.0) }
+fn c_border() -> Hsla   { hsla(0.62, 0.15, 0.16, 1.0) }
+fn c_accent() -> Hsla   { hsla(0.50, 0.85, 0.62, 1.0) }
+fn c_accent_t() -> Hsla { hsla(0.50, 0.85, 0.72, 1.0) }
+fn c_text() -> Hsla     { hsla(0.0, 0.0, 0.93, 1.0) }
+fn c_muted() -> Hsla    { hsla(0.62, 0.06, 0.40, 1.0) }
+fn c_green() -> Hsla    { hsla(0.38, 0.80, 0.55, 1.0) }
+fn c_canvas() -> Hsla   { hsla(0.62, 0.18, 0.04, 1.0) }
+
+/// Convert a StimulusEpoch (samples[time][channel]) to an FbcspTrial (channels[ch][time]).
+fn epoch_to_fbcsp_trial(ep: &StimulusEpoch) -> FbcspTrial {
+    let n_ch = ep.samples.first().map(|s| s.len()).unwrap_or(0);
+    let channels: Vec<Vec<f32>> = (0..n_ch).map(|ch| ep.channel(ch)).collect();
+    FbcspTrial {
+        channels,
+        label: ep.label.clone(),
+    }
+}
+
+/// Convert FBCSP prediction output to a ClassifierPrediction for the UI.
+fn fbcsp_to_classifier_prediction(
+    label: String,
+    scores: Vec<(String, f32)>,
+) -> ClassifierPrediction {
+    // Convert raw LDA discriminant scores to 0-1 similarities via softmax
+    let max_score = scores.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = scores.iter().map(|(_, s)| (s - max_score).exp()).collect();
+    let total: f32 = exps.iter().sum();
+    let similarities: std::collections::HashMap<String, f32> = scores
+        .iter()
+        .zip(exps.iter())
+        .map(|((l, _), &e)| (l.clone(), e / total.max(1e-10)))
+        .collect();
+    let confidence = similarities.get(&label).copied().unwrap_or(0.0);
+    let is_novel = confidence < 0.3;
+
+    ClassifierPrediction {
+        predicted_label: label,
+        confidence,
+        similarities,
+        is_novel,
+    }
+}
+
+/// Map a detected action label to a voice-leading type.
+///
+/// In Tymoczko's chord-space geometry, graph edges ARE voice leadings.
+/// Each action consistently maps to the same kind of voice motion:
+///
+///   blink        → transpose up (all voices rise)
+///   jaw clench   → transpose down (all voices fall)
+///   right hand   → raise top voice (expand chord upward)
+///   left hand    → lower top voice (contract chord from above)
+///   eyes closed  → raise bottom voice (contract chord from below)
+///   eyes open    → lower bottom voice (expand chord downward)
+fn action_voice_leading(label: &str) -> Option<tonnetz::VoiceLeadingKind> {
+    use tonnetz::VoiceLeadingKind::*;
+    let l = label.to_ascii_lowercase();
+    let l = l.trim();
+    match l.as_ref() {
+        "blink" | "blink_right" | "blink right"       => Some(TransposeUp),
+        "blink_left" | "blink left"                    => Some(TransposeDown),
+        "blink_both" | "blink both"                    => None, // confirm, not motion
+
+        "jaw_clench" | "jaw clench" | "jaw"            => Some(TransposeDown),
+
+        "motor_right_hand" | "motor right hand"
+        | "right_hand" | "right hand"                   => Some(RaiseTop),
+        "motor_left_hand" | "motor left hand"
+        | "left_hand" | "left hand"                     => Some(LowerTop),
+
+        "eyes_closed" | "eyes closed" | "relax"         => Some(RaiseBottom),
+        "eyes_open" | "eyes open" | "focus" | "focused" => Some(LowerBottom),
+
+        "breath_hold" | "breath hold"                    => Some(RaiseTop),
+
+        _ => None,
+    }
+}
 
 // PCA constants
 const PCA_FFT_SIZE: usize = 64;
@@ -512,11 +608,17 @@ impl MindDaw {
             spectrum_band: BrainWaveBand::All,
 
             soundboard_handle: None,
+            sc_handle: None,
+            sc_voice: sc::Voice::Pad,
+            sc_params: sc::ChordParams::default(),
+            sc_profiles: sc::builtin_profiles(),
+            sc_active_profile: None,
             sb: SoundboardUiState::default(),
 
             tonnetz_state: tonnetz::TonnetzState::new(tonnetz::OrbifoldType::Dyads),
             prev_tonnetz_chord_idx: 0,
-            tonnetz_muted: true,
+            tonnetz_muted: false,
+            tonnetz_manual_nav: true,
 
             calibration_state: CalibrationState::new(cognionics::NUM_CHANNELS),
             control_state: ControlState::default(),
@@ -528,6 +630,7 @@ impl MindDaw {
             detecting_blink: false,
             detecting_jaw_clench: false,
             live_band_powers: calibration::BandPowers::default(),
+            last_action_nav: std::time::Instant::now(),
 
             rec_ring: VecDeque::with_capacity(REC_RING_CAPACITY),
             rec: RecorderUiState::default(),
@@ -752,8 +855,40 @@ impl MindDaw {
             if self.rec.epochs_since_retrain >= RETRAIN_EVERY {
                 self.rec.epochs_since_retrain = 0;
                 self.rec.classifier = TrainedClassifier::train(&self.rec.session.epochs);
+                self.rec_train_fbcsp();
             }
             cx.notify();
+        }
+    }
+
+    /// Train FBCSP model from the current session epochs.
+    fn rec_train_fbcsp(&mut self) {
+        let trials: Vec<FbcspTrial> = self
+            .rec
+            .session
+            .epochs
+            .iter()
+            .map(|ep| epoch_to_fbcsp_trial(ep))
+            .collect();
+        let sr = self
+            .rec
+            .session
+            .epochs
+            .first()
+            .map(|e| e.sample_rate)
+            .unwrap_or(300.0);
+        match FbcspModel::train(&trials, sr) {
+            Some(model) => {
+                eprintln!(
+                    "[fbcsp] trained: {} classes, {} features",
+                    model.labels.len(),
+                    model.n_features()
+                );
+                self.rec.fbcsp_model = Some(model);
+            }
+            None => {
+                eprintln!("[fbcsp] not enough data to train");
+            }
         }
     }
 
@@ -927,11 +1062,22 @@ impl MindDaw {
                             this.detecting_jaw_clench = jaw;
                             this.live_band_powers = bands.clone();
                             let now = std::time::Instant::now();
+                            // Debounce: only log if the same event wasn't logged in the last 0.5s
                             if blink {
-                                this.detected_events.push_back((now, "Blink".into()));
+                                let recent = this.detected_events.iter().rev()
+                                    .find(|(_, n)| n == "Blink")
+                                    .is_some_and(|(t, _)| t.elapsed().as_secs_f32() < 0.5);
+                                if !recent {
+                                    this.detected_events.push_back((now, "Blink".into()));
+                                }
                             }
                             if jaw {
-                                this.detected_events.push_back((now, "Jaw clench".into()));
+                                let recent = this.detected_events.iter().rev()
+                                    .find(|(_, n)| n == "Jaw clench")
+                                    .is_some_and(|(t, _)| t.elapsed().as_secs_f32() < 0.5);
+                                if !recent {
+                                    this.detected_events.push_back((now, "Jaw clench".into()));
+                                }
                             }
                             // Keep only last 20 events and prune old ones (> 5s)
                             while this.detected_events.len() > 20 {
@@ -965,8 +1111,54 @@ impl MindDaw {
                                 &mut this.control_state,
                             );
 
-                            // Navigate orbifold using ControlState (confidence-weighted)
-                            this.tonnetz_state.update_from_control(&this.control_state);
+                            // Feed EEG state to sequencer for real-time modulation
+                            if let Some(ref h) = this.sc_handle {
+                                h.update_eeg(
+                                    this.control_state.tension,
+                                    this.control_state.stability,
+                                    this.control_state.motion_x,
+                                    this.control_state.motion_y,
+                                    this.control_state.confidence_continuous,
+                                );
+                            }
+
+                            // Navigate orbifold using ControlState (skip in manual nav mode)
+                            if !this.tonnetz_manual_nav {
+                                this.tonnetz_state.update_from_control(&this.control_state);
+                            }
+
+                            // Action-driven navigation: detected events → voice-leading jumps.
+                            // Each edge in the orbifold graph IS a voice leading (Tymoczko).
+                            // Actions map to voice-leading types, not spatial directions.
+                            // Debounce: at most one jump per 400 ms.
+                            if this.tonnetz_manual_nav
+                                && this.last_action_nav.elapsed().as_secs_f32() > 0.4
+                            {
+                                let mut nav_kind: Option<tonnetz::VoiceLeadingKind> = None;
+
+                                // Raw blink / jaw clench detections
+                                if blink {
+                                    nav_kind = action_voice_leading("blink");
+                                }
+                                if jaw && nav_kind.is_none() {
+                                    nav_kind = action_voice_leading("jaw_clench");
+                                }
+                                // FBCSP classifier predictions
+                                if nav_kind.is_none() {
+                                    if let Some(ref pred) = this.rec.last_prediction {
+                                        if pred.confidence > 0.5 && !pred.is_novel {
+                                            nav_kind =
+                                                action_voice_leading(&pred.predicted_label);
+                                        }
+                                    }
+                                }
+
+                                if let Some(kind) = nav_kind {
+                                    if this.tonnetz_state.navigate_by_voice_leading(kind) {
+                                        this.last_action_nav = now;
+                                    }
+                                }
+                            }
 
                             // Play chord when it changes
                             if this.tonnetz_state.current_chord_idx
@@ -992,21 +1184,31 @@ impl MindDaw {
                                 }
                             }
 
-                            // Recorder: live prediction
+                            // Recorder: live prediction (prefer FBCSP, fallback to cosine)
                             if this.rec.mode == RecorderMode::Predicting {
-                                if let Some(clf) = this.rec.classifier.clone() {
-                                    if let Some(ep) = this.rec_ring_to_epoch("live") {
+                                if let Some(ep) = this.rec_ring_to_epoch("live") {
+                                    let pred = if let Some(ref fbcsp) = this.rec.fbcsp_model {
+                                        // FBCSP + shrinkage LDA
+                                        let trial = epoch_to_fbcsp_trial(&ep);
+                                        let (label, scores) = fbcsp.predict(&trial.channels);
+                                        Some(fbcsp_to_classifier_prediction(label, scores))
+                                    } else if let Some(ref clf) = this.rec.classifier {
+                                        // Fallback: cosine similarity
                                         let feat = extract_features(&ep);
                                         let feat = if this.rec.normalize_with_baseline {
                                             if let Some(ref bl) = this.rec.baseline {
                                                 baseline_normalize(&feat, bl)
                                             } else { feat }
                                         } else { feat };
-                                        let pred = predict_features(&feat, &clf);
+                                        Some(predict_features(&feat, clf))
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(pred) = pred {
                                         if this.rec.prediction_history.len() >= 10 {
                                             this.rec.prediction_history.pop_front();
                                         }
-                                        // Log confident classifier predictions as detected events
                                         if pred.confidence > 0.4 {
                                             let label = pred.predicted_label.replace('_', " ");
                                             let last_same = this.detected_events.back()
@@ -1037,6 +1239,10 @@ impl MindDaw {
                         // Feed calibration from raw Cognionics ring buffers
                         // (not the outlier-clipped waveform data).
                         this.calibration_state.feed_raw_bufs(
+                            &this.cog_buffer, 0.033,
+                        );
+                        // Feed action training protocol (cued trials for FBCSP)
+                        this.calibration_state.feed_action_training(
                             &this.cog_buffer, 0.033,
                         );
 
@@ -1071,21 +1277,36 @@ impl Render for MindDaw {
             .flex_col()
             .size_full()
             .overflow_hidden()
-            .bg(cx.theme().background)
-            .p_4()
-            .gap_4()
+            .bg(c_bg())
+            // Accent strip
+            .child(div().h(px(2.0)).w_full().bg(c_accent()))
             // Header
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .px(px(20.0))
+                    .py(px(12.0))
+                    .bg(c_surface())
                     .child(
                         div()
-                            .text_xl()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(cx.theme().foreground)
-                            .child("mind-daw — EEG Streams"),
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(c_accent_t())
+                                    .child("mind-daw"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(c_muted())
+                                    .child("neural audio workstation"),
+                            ),
                     )
                     .child(if scanning {
                         Button::new("scan")
@@ -1093,13 +1314,14 @@ impl Render for MindDaw {
                             .disabled(true)
                     } else {
                         Button::new("scan")
-                            .primary()
                             .label("Scan LSL")
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.scan(cx);
                             }))
                     }),
             )
+            // Separator
+            .child(div().h(px(1.0)).w_full().bg(c_border()))
             // ── Cognionics panel ─────────────────────────────────────────
             .child(self.render_cog_panel(&cog_state, &cog_waveform_data, cx))
             // Stream list
@@ -1110,7 +1332,8 @@ impl Render for MindDaw {
                     .gap_2()
                     .children(if discovered.is_empty() {
                         vec![div()
-                            .text_color(cx.theme().muted_foreground)
+                            .px(px(20.0))
+                            .text_color(c_muted())
                             .child(if scanning {
                                 "Searching for LSL streams..."
                             } else {
@@ -1176,26 +1399,9 @@ impl MindDaw {
     fn render_lsl_panel(
         &mut self,
         waveform_data: &[Vec<f32>],
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> Option<Div> {
         let meta = self.paired_meta.as_ref()?.clone();
-        let ch_count = meta.channel_count as usize;
-
-        let audio_btn = if self.audio_enabled {
-            Button::new("lsl-audio-toggle")
-                .danger()
-                .label("Stop Audio")
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.stop_audio(cx);
-                }))
-        } else {
-            Button::new("lsl-audio-toggle")
-                .primary()
-                .label("Start Audio")
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.start_audio(ch_count, cx);
-                }))
-        };
 
         Some(
             div()
@@ -1210,25 +1416,18 @@ impl MindDaw {
                     div()
                         .flex()
                         .items_center()
-                        .justify_between()
+                        .gap_2()
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .size(px(8.0))
-                                        .rounded_full()
-                                        .bg(gpui_component::green_500()),
-                                )
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(format!("Paired: {}", meta.name)),
-                                ),
+                                .size(px(8.0))
+                                .rounded_full()
+                                .bg(gpui_component::green_500()),
                         )
-                        .child(audio_btn),
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(format!("Paired: {}", meta.name)),
+                        ),
                 )
                 .child(div().text_sm().child(format!(
                     "{} channels @ {:.0} Hz",
@@ -1259,6 +1458,40 @@ impl MindDaw {
         )
     }
 
+    fn render_tab(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        tab: Tab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let is_active = self.active_tab == tab;
+        div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .items_center()
+            .cursor(CursorStyle::PointingHand)
+            .px(px(14.0))
+            .py(px(8.0))
+            .text_sm()
+            .text_color(if is_active { c_accent_t() } else { c_muted() })
+            .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.active_tab = tab;
+                cx.notify();
+            }))
+            .child(label)
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .h(px(2.0))
+                    .w_full()
+                    .rounded_full()
+                    .bg(if is_active { c_accent() } else { hsla(0.0, 0.0, 0.0, 0.0) }),
+            )
+    }
+
     fn render_cog_panel(
         &mut self,
         cog_state: &CogState,
@@ -1271,195 +1504,172 @@ impl MindDaw {
             .flex_1()
             .min_h_0()
             .gap_2()
+            .mx(px(8.0))
+            .my(px(6.0))
             .p_3()
-            .rounded_md()
+            .rounded(px(8.0))
             .border_1()
-            .border_color(cx.theme().border);
+            .border_color(c_border())
+            .bg(c_surface());
 
         match cog_state {
-            CogState::Disconnected => panel.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().foreground)
-                            .child("Cognionics HD-72"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("cog-scan")
-                                    .primary()
-                                    .label("Connect Cognionics")
-                                    .on_click(cx.listener(|this, _, _window, cx| {
-                                        this.cog_scan(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("cog-demo")
-                                    .label("Demo Mode")
-                                    .on_click(cx.listener(|this, _, _window, cx| {
-                                        this.cog_demo(cx);
-                                    })),
-                            ),
-                    ),
-            ),
+            CogState::Disconnected => panel
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .size(px(10.0))
+                                        .rounded_full()
+                                        .bg(c_muted()),
+                                )
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(c_text())
+                                        .child("Cognionics HD-72"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(c_muted())
+                                .child("64-channel EEG · 300 Hz · Bluetooth"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .mt_2()
+                                .child(
+                                    Button::new("cog-scan")
+                                        .primary()
+                                        .label("Connect")
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.cog_scan(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("cog-demo")
+                                        .label("Demo Mode")
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.cog_demo(cx);
+                                        })),
+                                ),
+                        ),
+                ),
 
-            CogState::Scanning => panel.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().foreground)
-                            .child("Cognionics HD-72"),
-                    )
-                    .child(
-                        Button::new("cog-scanning")
-                            .label("Scanning...")
-                            .disabled(true),
-                    ),
-            ),
+            CogState::Scanning => panel
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(c_text())
+                                .child("Scanning for devices..."),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(c_muted())
+                                .child("Searching for Cognionics HD-72 via Bluetooth"),
+                        ),
+                ),
 
             CogState::Found { id, name } => {
                 let device_id = id.clone();
-                let label = format!("Connect to {name}");
-                panel.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(cx.theme().foreground)
-                                .child("Cognionics HD-72"),
-                        )
-                        .child(
-                            Button::new("cog-connect")
-                                .primary()
-                                .label(label)
-                                .on_click(cx.listener(move |this, _, _window, cx| {
-                                    this.cog_connect(device_id.clone(), cx);
-                                })),
-                        ),
-                )
-            }
-
-            CogState::Connecting => panel.child(
-                div()
-                    .flex()
+                let display_name = name.clone();
+                panel
                     .items_center()
-                    .justify_between()
+                    .justify_center()
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().foreground)
-                            .child("Cognionics HD-72"),
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .size(px(10.0))
+                                            .rounded_full()
+                                            .bg(hsla(0.12, 0.85, 0.55, 1.0)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(c_text())
+                                            .child(format!("Found: {display_name}")),
+                                    ),
+                            )
+                            .child(
+                                Button::new("cog-connect")
+                                    .primary()
+                                    .label("Connect")
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.cog_connect(device_id.clone(), cx);
+                                    })),
+                            ),
                     )
-                    .child(
-                        Button::new("cog-connecting")
-                            .label("Connecting...")
-                            .disabled(true),
-                    ),
-            ),
+            }
+
+            CogState::Connecting => panel
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(c_accent_t())
+                                .child("Connecting..."),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(c_muted())
+                                .child("Establishing Bluetooth RFCOMM link"),
+                        ),
+                ),
 
             CogState::Streaming => {
-                let audio_btn = if self.audio_enabled {
-                    Button::new("cog-audio-toggle")
-                        .danger()
-                        .label("Stop Audio")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.stop_audio(cx);
-                        }))
-                } else {
-                    Button::new("cog-audio-toggle")
-                        .primary()
-                        .label("Start Audio")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.start_audio(cognionics::NUM_CHANNELS, cx);
-                        }))
-                };
-
                 let active_tab = self.active_tab;
 
-                let waves_btn = if active_tab == Tab::Waves {
-                    Button::new("tab-waves").label("Waves").primary()
-                } else {
-                    Button::new("tab-waves")
-                        .label("Waves")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.active_tab = Tab::Waves;
-                            cx.notify();
-                        }))
-                };
-                let spectrum_btn = if active_tab == Tab::Spectrum {
-                    Button::new("tab-spectrum").label("Spectrum").primary()
-                } else {
-                    Button::new("tab-spectrum")
-                        .label("Spectrum")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.active_tab = Tab::Spectrum;
-                            cx.notify();
-                        }))
-                };
-                let pca_btn = if active_tab == Tab::Pca {
-                    Button::new("tab-pca").label("PCA").primary()
-                } else {
-                    Button::new("tab-pca")
-                        .label("PCA")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.active_tab = Tab::Pca;
-                            cx.notify();
-                        }))
-                };
-                let words_btn = if active_tab == Tab::Words {
-                    Button::new("tab-words").label("Words").primary()
-                } else {
-                    Button::new("tab-words")
-                        .label("Words")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.active_tab = Tab::Words;
-                            cx.notify();
-                        }))
-                };
-                let soundboard_btn = if active_tab == Tab::Soundboard {
-                    Button::new("tab-soundboard").label("Soundboard").primary()
-                } else {
-                    Button::new("tab-soundboard")
-                        .label("Soundboard")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.active_tab = Tab::Soundboard;
-                            cx.notify();
-                        }))
-                };
-                let tonnetz_btn = if active_tab == Tab::Tonnetz {
-                    Button::new("tab-tonnetz").label("Tonnetz").primary()
-                } else {
-                    Button::new("tab-tonnetz")
-                        .label("Tonnetz")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.active_tab = Tab::Tonnetz;
-                            cx.notify();
-                        }))
-                };
-                let calib_btn = if active_tab == Tab::Calibration {
-                    Button::new("tab-calib").label("Calibrate").primary()
-                } else {
-                    Button::new("tab-calib")
-                        .label("Calibrate")
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.active_tab = Tab::Calibration;
-                            cx.notify();
-                        }))
-                };
+                let waves_tab = self.render_tab("tab-waves", "Waves", Tab::Waves, cx);
+                let spectrum_tab = self.render_tab("tab-spectrum", "Spectrum", Tab::Spectrum, cx);
+                let pca_tab = self.render_tab("tab-pca", "PCA", Tab::Pca, cx);
+                let words_tab = self.render_tab("tab-words", "Words", Tab::Words, cx);
+                let soundboard_tab = self.render_tab("tab-soundboard", "Soundboard", Tab::Soundboard, cx);
+                let tonnetz_tab = self.render_tab("tab-tonnetz", "Tonnetz", Tab::Tonnetz, cx);
+                let calib_tab = self.render_tab("tab-calib", "Calibrate", Tab::Calibration, cx);
 
                 let content: Div = if active_tab == Tab::Calibration {
                     self.render_calibration_view(cx)
@@ -1505,7 +1715,8 @@ impl MindDaw {
                 };
 
                 panel
-                .border_color(gpui_component::green_500())
+                .border_color(hsla(0.38, 0.40, 0.25, 0.5))
+                // Header row
                 .child(
                     div()
                         .flex()
@@ -1515,42 +1726,53 @@ impl MindDaw {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap_2()
+                                .gap(px(8.0))
                                 .child(
                                     div()
                                         .size(px(8.0))
                                         .rounded_full()
-                                        .bg(gpui_component::green_500()),
+                                        .bg(c_green()),
                                 )
                                 .child(
                                     div()
+                                        .text_sm()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(cx.theme().foreground)
-                                        .child("Cognionics HD-72 — 64ch @ 300 Hz"),
+                                        .text_color(c_text())
+                                        .child("Cognionics HD-72"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(c_muted())
+                                        .child("64ch · 300 Hz"),
                                 ),
                         )
                         .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(waves_btn)
-                                .child(spectrum_btn)
-                                .child(pca_btn)
-                                .child(words_btn)
-                                .child(soundboard_btn)
-                                .child(tonnetz_btn)
-                                .child(calib_btn)
-                                .child(audio_btn)
-                                .child(
-                                    Button::new("cog-disconnect")
-                                        .danger()
-                                        .label("Disconnect")
-                                        .on_click(cx.listener(|this, _, _window, cx| {
-                                            this.cog_disconnect(cx);
-                                        })),
-                                ),
+                            Button::new("cog-disconnect")
+                                .danger()
+                                .label("Disconnect")
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.cog_disconnect(cx);
+                                })),
                         ),
                 )
+                // Tab bar
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .child(waves_tab)
+                        .child(spectrum_tab)
+                        .child(pca_tab)
+                        .child(words_tab)
+                        .child(soundboard_tab)
+                        .child(tonnetz_tab)
+                        .child(calib_tab),
+                )
+                // Separator
+                .child(div().h(px(1.0)).w_full().bg(c_border()))
+                // Content
                 .child(
                     div()
                         .id("tab-content-scroll")
@@ -1561,25 +1783,42 @@ impl MindDaw {
                 )
             }
 
-            CogState::Error(msg) => panel.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(gpui_component::red_500())
-                            .child(msg.clone()),
-                    )
-                    .child(
-                        Button::new("cog-retry")
-                            .label("Retry")
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.cog_scan(cx);
-                            })),
-                    ),
-            ),
+            CogState::Error(msg) => panel
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(hsla(0.0, 0.75, 0.60, 1.0))
+                                .child(msg.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("cog-retry")
+                                        .primary()
+                                        .label("Retry")
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.cog_scan(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("cog-demo-err")
+                                        .label("Demo Mode")
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.cog_demo(cx);
+                                        })),
+                                ),
+                        ),
+                ),
         }
     }
 }
@@ -1761,7 +2000,7 @@ fn radar_canvas(classes: &[(String, f32)]) -> impl IntoElement {
             }
 
             // Background
-            window.paint_quad(gpui::fill(state.bounds, gpui::hsla(0.0, 0.0, 0.06, 1.0)));
+            window.paint_quad(gpui::fill(state.bounds, c_canvas()));
 
             let cx = state.cx;
             let cy = state.cy;
@@ -2668,10 +2907,10 @@ fn waveform_canvas(data: &[f32], sample_rate: f32) -> impl IntoElement {
             let bounds = state.bounds;
 
             // Paint background box
-            window.paint_quad(gpui::fill(bounds, gpui::hsla(0.0, 0.0, 0.08, 1.0)));
+            window.paint_quad(gpui::fill(bounds, c_canvas()));
             window.paint_quad(gpui::outline(
                 bounds,
-                gpui::hsla(0.0, 0.0, 0.25, 1.0),
+                c_border(),
                 gpui::BorderStyle::Solid,
             ));
 
@@ -2849,10 +3088,10 @@ fn spectrum_canvas(data: &[f32], ch: usize, band: BrainWaveBand) -> impl IntoEle
               window: &mut Window,
               _cx: &mut App| {
             // Background
-            window.paint_quad(gpui::fill(bounds, gpui::hsla(0.0, 0.0, 0.06, 1.0)));
+            window.paint_quad(gpui::fill(bounds, c_canvas()));
             window.paint_quad(gpui::outline(
                 bounds,
-                gpui::hsla(0.0, 0.0, 0.2, 1.0),
+                c_border(),
                 gpui::BorderStyle::Solid,
             ));
 
@@ -3006,9 +3245,9 @@ impl MindDaw {
                         div()
                             .text_xs()
                             .text_color(if is_selected {
-                                gpui::hsla(0.33, 0.9, 0.6, 1.0)
+                                c_accent_t()
                             } else {
-                                gpui::hsla(0.0, 0.0, 0.5, 1.0)
+                                c_muted()
                             })
                             .child(format!("Ch{ch}")),
                     )
@@ -3018,7 +3257,7 @@ impl MindDaw {
                     cell = cell
                         .rounded(px(3.0))
                         .border_1()
-                        .border_color(gpui::hsla(0.33, 0.9, 0.55, 0.8));
+                        .border_color(c_accent());
                 }
 
                 row_div = row_div.child(cell);
@@ -3203,12 +3442,85 @@ impl MindDaw {
     // ── Tonnetz / Orbifold ──────────────────────────────────────────────────
 
     fn play_tonnetz_chord(&mut self) {
+        // Enforce chord type restriction from the active profile.
+        // Only filter triads (3-note chords) — dyad type labels are different.
+        if let Some(pi) = self.sc_active_profile {
+            let allowed = &self.sc_profiles[pi].allowed_chord_types;
+            if !allowed.is_empty() {
+                if let Some(chord) = self.tonnetz_state.current_chord() {
+                    if chord.n() >= 3 && !allowed.contains(&chord.type_label()) {
+                        let idx = self.tonnetz_state.current_chord_idx;
+                        let mut best_d = f32::INFINITY;
+                        let mut best_i = idx;
+                        for e in &self.tonnetz_state.edges {
+                            let other = if e.from == idx {
+                                e.to
+                            } else if e.to == idx {
+                                e.from
+                            } else {
+                                continue;
+                            };
+                            let oc = &self.tonnetz_state.nodes[other].chord;
+                            if allowed.contains(&oc.type_label()) && e.distance < best_d {
+                                best_d = e.distance;
+                                best_i = other;
+                            }
+                        }
+                        if best_i != idx {
+                            self.tonnetz_state.current_chord_idx = best_i;
+                            self.tonnetz_state.position = [
+                                self.tonnetz_state.nodes[best_i].ox,
+                                self.tonnetz_state.nodes[best_i].oy,
+                                self.tonnetz_state.nodes[best_i].oz,
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(chord) = self.tonnetz_state.current_chord() {
+            let midi_notes = tonnetz::chord_to_midi_notes(chord);
+
+            // SuperCollider (preferred if connected)
+            if let Some(ref h) = self.sc_handle {
+                let has_sequencer = self
+                    .sc_active_profile
+                    .and_then(|i| self.sc_profiles.get(i))
+                    .is_some_and(|p| p.bpm > 0.0 && !p.rhythm_pattern.is_empty());
+
+                if has_sequencer {
+                    // Sequencer is running — always update its chord (even if "muted")
+                    h.update_chord(midi_notes.clone());
+                    return;
+                }
+            }
+        }
+
+        // Non-sequencer path: respect mute
         if self.tonnetz_muted {
             return;
         }
-        self.sb_ensure_engine();
         if let Some(chord) = self.tonnetz_state.current_chord() {
             let midi_notes = tonnetz::chord_to_midi_notes(chord);
+
+            if let Some(ref h) = self.sc_handle {
+                let random_pan = self
+                    .sc_active_profile
+                    .and_then(|i| self.sc_profiles.get(i))
+                    .map(|p| p.random_pan)
+                    .unwrap_or(false);
+                h.play_chord(
+                    midi_notes.clone(),
+                    self.sc_voice,
+                    self.sc_params.clone(),
+                    random_pan,
+                );
+                return;
+            }
+
+            // Fallback: built-in soundboard
+            self.sb_ensure_engine();
             if let Some(ref h) = self.soundboard_handle {
                 for &midi in &midi_notes {
                     let _ = h.cmd_tx.try_send(soundboard::SbCommand::PlayNote {
@@ -3220,6 +3532,12 @@ impl MindDaw {
                     });
                 }
             }
+        }
+    }
+
+    fn ensure_sc(&mut self) {
+        if self.sc_handle.is_none() {
+            self.sc_handle = Some(sc::spawn_sc_worker());
         }
     }
 
@@ -3307,12 +3625,24 @@ impl MindDaw {
 
         // ── Canvas data ─────────────────────────────────────────────────────
 
-        // Node data: (ox, oy, oz, hue_idx, is_current)
-        let node_data: Vec<(f32, f32, f32, u8, bool)> = state
+        // Get allowed chord types from active profile (empty = all allowed)
+        let allowed_types: Vec<&str> = self
+            .sc_active_profile
+            .and_then(|i| self.sc_profiles.get(i))
+            .map(|p| p.allowed_chord_types.clone())
+            .unwrap_or_default();
+
+        // Node data: (ox, oy, oz, hue_idx, is_current, is_allowed)
+        let node_data: Vec<(f32, f32, f32, u8, bool, bool)> = state
             .nodes
             .iter()
             .enumerate()
-            .map(|(i, n)| (n.ox, n.oy, n.oz, n.chord.hue_index(), i == current_idx))
+            .map(|(i, n)| {
+                let allowed = allowed_types.is_empty()
+                    || n.chord.n() < 3  // don't filter dyads
+                    || allowed_types.contains(&n.chord.type_label());
+                (n.ox, n.oy, n.oz, n.chord.hue_index(), i == current_idx, allowed)
+            })
             .collect();
 
         let edges: Vec<(usize, usize, f32)> = state
@@ -3327,6 +3657,13 @@ impl MindDaw {
         let pitch_angle = state.pitch;
         let zoom = state.zoom;
 
+        // Shared layout params for dyad click-to-play (left, top, side of the square)
+        let dyad_layout = std::rc::Rc::new(std::cell::Cell::new((0.0_f32, 0.0_f32, 1.0_f32)));
+        let layout_writer = dyad_layout.clone();
+
+        // Clone node_data for the click handler (canvas closure will move the original)
+        let node_data_for_click = node_data.clone();
+
         let orbifold_canvas = canvas(
             move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| bounds,
             move |_bounds: Bounds<Pixels>,
@@ -3338,7 +3675,7 @@ impl MindDaw {
                 let bx: f32 = bounds.origin.x.into();
                 let by: f32 = bounds.origin.y.into();
 
-                window.paint_quad(gpui::fill(bounds, gpui::hsla(0.0, 0.0, 0.06, 1.0)));
+                window.paint_quad(gpui::fill(bounds, c_canvas()));
 
                 let hues: [f32; 6] = [0.58, 0.75, 0.0, 0.15, 0.45, 0.5];
                 let margin = 50.0f32;
@@ -3350,6 +3687,9 @@ impl MindDaw {
                     let cy0 = by + h / 2.0;
                     let left = cx0 - side / 2.0;
                     let top = cy0 - side / 2.0;
+
+                    // Export layout params for click-to-play handler
+                    layout_writer.set((left, top, side));
 
                     let to_screen = |ox: f32, oy: f32| -> (f32, f32) {
                         let sx = left + (ox / 6.0) * side;
@@ -3424,7 +3764,7 @@ impl MindDaw {
 
                     // Edges, trail, nodes (2D)
                     for &(from, to, dist) in &edges {
-                        if let (Some(&(ox1, oy1, _, _, c1)), Some(&(ox2, oy2, _, _, c2))) =
+                        if let (Some(&(ox1, oy1, _, _, c1, _)), Some(&(ox2, oy2, _, _, c2, _))) =
                             (node_data.get(from), node_data.get(to))
                         {
                             let (x1, y1) = to_screen(ox1, oy1);
@@ -3442,7 +3782,7 @@ impl MindDaw {
                         }
                     }
                     for pair in trail.windows(2) {
-                        if let (Some(&(ox1, oy1, _, _, _)), Some(&(ox2, oy2, _, _, _))) =
+                        if let (Some(&(ox1, oy1, _, _, _, _)), Some(&(ox2, oy2, _, _, _, _))) =
                             (node_data.get(pair[0]), node_data.get(pair[1]))
                         {
                             let (x1, y1) = to_screen(ox1, oy1);
@@ -3455,9 +3795,9 @@ impl MindDaw {
                             }
                         }
                     }
-                    for &(ox, oy, _, hue_idx, is_current) in &node_data {
+                    for &(ox, oy, _, hue_idx, is_current, is_allowed) in &node_data {
                         let (x, y) = to_screen(ox, oy);
-                        let sz = if is_current { 16.0 } else { 8.0 };
+                        let sz = if is_current { 16.0 } else if is_allowed { 8.0 } else { 5.0 };
                         let nb = Bounds {
                             origin: point(px(x - sz / 2.0), px(y - sz / 2.0)),
                             size: size(px(sz), px(sz)),
@@ -3470,9 +3810,12 @@ impl MindDaw {
                             };
                             window.paint_quad(gpui::fill(glow, gpui::hsla(0.33, 0.9, 0.6, 0.25)));
                             window.paint_quad(gpui::fill(nb, gpui::hsla(0.33, 0.9, 0.7, 1.0)));
-                        } else {
+                        } else if is_allowed {
                             let hue = hues[hue_idx as usize % hues.len()];
                             window.paint_quad(gpui::fill(nb, gpui::hsla(hue, 0.6, 0.5, 0.7)));
+                        } else {
+                            // Blocked: dim, desaturated, smaller
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(0.0, 0.0, 0.2, 0.3)));
                         }
                     }
                 } else {
@@ -3490,7 +3833,7 @@ impl MindDaw {
                     let (mut xmn, mut xmx) = (f32::INFINITY, f32::NEG_INFINITY);
                     let (mut ymn, mut ymx) = (f32::INFINITY, f32::NEG_INFINITY);
                     let (mut zmn, mut zmx) = (f32::INFINITY, f32::NEG_INFINITY);
-                    for &(ox, oy, oz, _, _) in &node_data {
+                    for &(ox, oy, oz, _, _, _) in &node_data {
                         xmn = xmn.min(ox); xmx = xmx.max(ox);
                         ymn = ymn.min(oy); ymx = ymx.max(oy);
                         zmn = zmn.min(oz); zmx = zmx.max(oz);
@@ -3628,19 +3971,19 @@ impl MindDaw {
                     }
 
                     // ── Project and depth-sort chord nodes ───────────────
-                    let mut screen: Vec<(usize, f32, f32, f32, u8, bool)> = node_data
+                    let mut screen: Vec<(usize, f32, f32, f32, u8, bool, bool)> = node_data
                         .iter()
                         .enumerate()
-                        .map(|(i, &(ox, oy, oz, hi, ic))| {
+                        .map(|(i, &(ox, oy, oz, hi, ic, ia))| {
                             let (sx, sy, d) = project(ox, oy, oz);
-                            (i, sx, sy, d, hi, ic)
+                            (i, sx, sy, d, hi, ic, ia)
                         })
                         .collect();
                     screen.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
 
                     let mut spos = vec![(0.0f32, 0.0f32); node_data.len()];
                     let mut scur = vec![false; node_data.len()];
-                    for &(i, sx, sy, _, _, ic) in &screen {
+                    for &(i, sx, sy, _, _, ic, _) in &screen {
                         spos[i] = (sx, sy);
                         scur[i] = ic;
                     }
@@ -3675,9 +4018,11 @@ impl MindDaw {
                     }
 
                     // Nodes (depth-sorted, back-to-front)
-                    for &(_i, x, y, depth, hue_idx, is_current) in &screen {
+                    for &(_i, x, y, depth, hue_idx, is_current, is_allowed) in &screen {
                         let ds = 0.7 + 0.3 * (depth + 1.0) / 2.0;
-                        let sz = if is_current { 14.0 * ds } else { 7.0 * ds };
+                        let sz = if is_current { 14.0 * ds }
+                            else if is_allowed { 7.0 * ds }
+                            else { 4.0 * ds };
                         let nb = Bounds {
                             origin: point(px(x - sz / 2.0), px(y - sz / 2.0)),
                             size: size(px(sz), px(sz)),
@@ -3690,10 +4035,14 @@ impl MindDaw {
                             };
                             window.paint_quad(gpui::fill(glow, gpui::hsla(0.33, 0.9, 0.6, 0.2)));
                             window.paint_quad(gpui::fill(nb, gpui::hsla(0.33, 0.9, 0.7, 1.0)));
-                        } else {
+                        } else if is_allowed {
                             let hue = hues[hue_idx as usize % hues.len()];
                             let a = 0.4 + 0.4 * ds;
                             window.paint_quad(gpui::fill(nb, gpui::hsla(hue, 0.6, 0.5, a)));
+                        } else {
+                            // Blocked: dim, desaturated
+                            let a = 0.15 + 0.1 * ds;
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(0.0, 0.0, 0.2, a)));
                         }
                     }
                 }
@@ -3705,6 +4054,7 @@ impl MindDaw {
         // For triads: wrap canvas with mouse drag for 3D rotation
         let orbifold_canvas = if !is_dyads {
             div()
+                .id("triad-canvas-interact")
                 .cursor(CursorStyle::PointingHand)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -3758,12 +4108,78 @@ impl MindDaw {
                 }))
                 .child(orbifold_canvas)
         } else {
-            div().child(orbifold_canvas)
+            // Dyads: wrap canvas with click-to-navigate handler.
+            let layout_reader = dyad_layout.clone();
+
+            div()
+                .id("dyad-canvas-click")
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        if !this.tonnetz_manual_nav {
+                            return;
+                        }
+                        let (left, top, side) = layout_reader.get();
+                        if side < 1.0 {
+                            return;
+                        }
+                        let mx: f32 = event.position.x.into();
+                        let my: f32 = event.position.y.into();
+
+                        // Invert to_screen: sx = left + ox/6 * side, sy = top + side - oy/12 * side
+                        let orb_x = (mx - left) / side * 6.0;
+                        let orb_y = (1.0 - (my - top) / side) * 12.0;
+
+                        // Bounds check
+                        if orb_x < -0.5 || orb_x > 6.5 || orb_y < -0.5 || orb_y > 12.5 {
+                            return;
+                        }
+
+                        // Find nearest node by orbifold distance
+                        let mut best_dist = f32::MAX;
+                        let mut best_idx = None;
+                        let period = 6.0_f32;
+                        for (i, &(ox, oy, _, _, _, _)) in node_data_for_click.iter().enumerate() {
+                            let raw_dx = (orb_x - ox).rem_euclid(period);
+                            let dx = raw_dx.min(period - raw_dx);
+                            let dy = orb_y - oy;
+                            let d = (dx * dx + dy * dy).sqrt();
+                            if d < best_dist {
+                                best_dist = d;
+                                best_idx = Some(i);
+                            }
+                        }
+
+                        // Only snap if click is reasonably close to a node
+                        if let Some(target) = best_idx {
+                            if best_dist < 1.5 {
+                                let old = this.tonnetz_state.current_chord_idx;
+                                if target != old {
+                                    this.tonnetz_state.chord_trail.push_back(old);
+                                    if this.tonnetz_state.chord_trail.len() > 64 {
+                                        this.tonnetz_state.chord_trail.pop_front();
+                                    }
+                                }
+                                this.prev_tonnetz_chord_idx = old;
+                                this.tonnetz_state.current_chord_idx = target;
+                                this.tonnetz_state.position = [
+                                    this.tonnetz_state.nodes[target].ox,
+                                    this.tonnetz_state.nodes[target].oy,
+                                    this.tonnetz_state.nodes[target].oz,
+                                ];
+                                this.play_tonnetz_chord();
+                                cx.notify();
+                            }
+                        }
+                    }),
+                )
+                .child(orbifold_canvas)
         };
 
-        // ── Voice leading info ──────────────────────────────────────────────
+        // ── Neighbor data ──────────────────────────────────────────────────
         let current_edges = self.tonnetz_state.current_edges();
-        let mut vl_items: Vec<(String, f32)> = current_edges
+        let mut neighbors: Vec<(usize, String, String, f32)> = current_edges
             .iter()
             .map(|e| {
                 let other_idx = if e.from == self.tonnetz_state.current_chord_idx {
@@ -3773,55 +4189,364 @@ impl MindDaw {
                 };
                 let other = &self.tonnetz_state.nodes[other_idx].chord;
                 (
-                    format!("{} ({})", other.label(), other.type_label()),
+                    other_idx,
+                    other.label(),
+                    other.type_label().to_string(),
                     e.distance,
                 )
             })
             .collect();
-        vl_items.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        vl_items.truncate(8);
+        neighbors.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
 
-        let mut vl_row = div().flex().flex_wrap().gap_2();
-        for (label, dist) in &vl_items {
-            vl_row = vl_row.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(label.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("d={dist:.2}")),
-                    ),
-            );
-        }
+        // ── Manual nav toggle ─────────────────────────────────────────────
+        let manual_nav_btn = if self.tonnetz_manual_nav {
+            Button::new("orb-manual-nav")
+                .label("Manual Nav")
+                .primary()
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.tonnetz_manual_nav = false;
+                    cx.notify();
+                }))
+        } else {
+            Button::new("orb-manual-nav")
+                .label("Manual Nav")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.tonnetz_manual_nav = true;
+                    cx.notify();
+                }))
+        };
 
-        let vl_section = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().muted_foreground)
-                    .child("VOICE LEADINGS (nearest)"),
+        // ── Neighbor navigation panel (side panel) ────────────────────────
+        let neighbor_panel = if self.tonnetz_manual_nav {
+            // Precompute graph node positions for mini-graph canvas
+            let graph_w = 220.0_f32;
+            let graph_h = 220.0_f32;
+            let gcx = graph_w / 2.0;
+            let gcy = graph_h / 2.0;
+            let grad = graph_w.min(graph_h) * 0.34;
+            let n_nb = neighbors.len().max(1);
+
+            // Get allowed types for the mini-graph
+            let mg_allowed: Vec<&str> = self
+                .sc_active_profile
+                .and_then(|pi| self.sc_profiles.get(pi))
+                .map(|p| p.allowed_chord_types.clone())
+                .unwrap_or_default();
+
+            // (canvas-local x, canvas-local y, node_index, hue, is_allowed)
+            let graph_nodes: Vec<(f32, f32, usize, f32, bool)> = neighbors
+                .iter()
+                .enumerate()
+                .map(|(i, (idx, _, _, _))| {
+                    let angle = i as f32 * 2.0 * std::f32::consts::PI / n_nb as f32
+                        - std::f32::consts::FRAC_PI_2;
+                    let chord = &self.tonnetz_state.nodes[*idx].chord;
+                    let hue_idx = chord.hue_index();
+                    let hue_f = [0.58_f32, 0.75, 0.0, 0.15, 0.45, 0.5][hue_idx as usize % 6];
+                    let allowed = mg_allowed.is_empty()
+                        || chord.n() < 3
+                        || mg_allowed.contains(&chord.type_label());
+                    (gcx + grad * angle.cos(), gcy + grad * angle.sin(), *idx, hue_f, allowed)
+                })
+                .collect();
+
+            // Shared canvas origin for click detection
+            let canvas_origin = std::rc::Rc::new(std::cell::Cell::new((0.0_f32, 0.0_f32)));
+            let origin_writer = canvas_origin.clone();
+            let origin_reader = canvas_origin.clone();
+            let nodes_for_paint = graph_nodes.clone();
+            let nodes_for_click = graph_nodes.clone();
+
+            // Current chord hue
+            let cur_hue_idx = self.tonnetz_state.nodes[current_idx].chord.hue_index();
+            let cur_hue = [0.58_f32, 0.75, 0.0, 0.15, 0.45, 0.5][cur_hue_idx as usize % 6];
+
+            // Neighbor short labels for painting
+            let nb_short_labels: Vec<String> = neighbors
+                .iter()
+                .map(|(idx, _, _, _)| self.tonnetz_state.nodes[*idx].chord.short_label())
+                .collect();
+            let cur_short_label = self.tonnetz_state.current_chord()
+                .map(|c| c.short_label())
+                .unwrap_or_default();
+
+            let graph_canvas = canvas(
+                move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                    let ox: f32 = bounds.origin.x.into();
+                    let oy: f32 = bounds.origin.y.into();
+                    origin_writer.set((ox, oy));
+                    (bounds, nodes_for_paint.clone(), ox, oy, gcx, gcy, cur_hue)
+                },
+                move |_bounds,
+                      (bounds, nodes, ox, oy, gcx, gcy, cur_hue): (
+                    Bounds<Pixels>,
+                    Vec<(f32, f32, usize, f32, bool)>,
+                    f32, f32, f32, f32, f32,
+                ),
+                      window: &mut Window,
+                      _cx: &mut App| {
+                    // Background
+                    window.paint_quad(gpui::fill(bounds, c_canvas()));
+                    window.paint_quad(gpui::outline(bounds, c_border(), gpui::BorderStyle::Solid));
+
+                    // Draw edges from center to each neighbor (dim blocked)
+                    for &(nx, ny, _, hue_f, nb_ok) in &nodes {
+                        let edge_alpha = if nb_ok { 0.7 } else { 0.15 };
+                        let mut path = PathBuilder::stroke(px(if nb_ok { 1.5 } else { 0.5 }));
+                        path.move_to(point(px(ox + gcx), px(oy + gcy)));
+                        path.line_to(point(px(ox + nx), px(oy + ny)));
+                        if let Ok(p) = path.build() {
+                            window.paint_path(p, hsla(hue_f, 0.30, 0.35, edge_alpha));
+                        }
+                    }
+
+                    // Draw neighbor nodes (dim blocked ones)
+                    let node_r = 10.0_f32;
+                    for &(nx, ny, _, hue_f, nb_ok) in &nodes {
+                        let (nr, sat, lum, alpha) = if nb_ok {
+                            (node_r, 0.65, 0.50, 0.9)
+                        } else {
+                            (6.0, 0.1, 0.25, 0.4) // smaller, dim
+                        };
+                        let nb = Bounds {
+                            origin: point(px(ox + nx - nr), px(oy + ny - nr)),
+                            size: size(px(nr * 2.0), px(nr * 2.0)),
+                        };
+                        window.paint_quad(gpui::fill(nb, hsla(hue_f, sat, lum, alpha)));
+                    }
+
+                    // Draw current node (center, larger)
+                    let cr = 14.0_f32;
+                    let cb = Bounds {
+                        origin: point(px(ox + gcx - cr), px(oy + gcy - cr)),
+                        size: size(px(cr * 2.0), px(cr * 2.0)),
+                    };
+                    // Glow
+                    let glow_r = cr + 6.0;
+                    let gb = Bounds {
+                        origin: point(px(ox + gcx - glow_r), px(oy + gcy - glow_r)),
+                        size: size(px(glow_r * 2.0), px(glow_r * 2.0)),
+                    };
+                    window.paint_quad(gpui::fill(gb, hsla(cur_hue, 0.50, 0.50, 0.15)));
+                    window.paint_quad(gpui::fill(cb, hsla(cur_hue, 0.75, 0.60, 1.0)));
+                },
             )
-            .child(vl_row);
+            .w(px(graph_w))
+            .h(px(graph_h));
 
-        // Navigation buttons
+            // Wrap canvas in a clickable container for graph node hit detection
+            let graph_container = div()
+                .id("graph-nav")
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        let (ox, oy) = origin_reader.get();
+                        let local_x: f32 = event.position.x.into();
+                        let local_y: f32 = event.position.y.into();
+                        let local_x = local_x - ox;
+                        let local_y = local_y - oy;
+
+                        // Find closest neighbor node within hit radius
+                        let mut best_dist = f32::MAX;
+                        let mut best_idx = None;
+                        for &(nx, ny, node_idx, _, _) in &nodes_for_click {
+                            let dx = local_x - nx;
+                            let dy = local_y - ny;
+                            let dist = (dx * dx + dy * dy).sqrt();
+                            if dist < 22.0 && dist < best_dist {
+                                best_dist = dist;
+                                best_idx = Some(node_idx);
+                            }
+                        }
+
+                        if let Some(target_idx) = best_idx {
+                            // Update trail
+                            let old_idx = this.tonnetz_state.current_chord_idx;
+                            this.tonnetz_state.chord_trail.push_back(old_idx);
+                            if this.tonnetz_state.chord_trail.len() > 64 {
+                                this.tonnetz_state.chord_trail.pop_front();
+                            }
+                            this.tonnetz_state.position_trail.push_back(
+                                this.tonnetz_state.position,
+                            );
+                            if this.tonnetz_state.position_trail.len() > 64 {
+                                this.tonnetz_state.position_trail.pop_front();
+                            }
+
+                            this.prev_tonnetz_chord_idx = old_idx;
+                            this.tonnetz_state.current_chord_idx = target_idx;
+                            this.tonnetz_state.position = [
+                                this.tonnetz_state.nodes[target_idx].ox,
+                                this.tonnetz_state.nodes[target_idx].oy,
+                                this.tonnetz_state.nodes[target_idx].oz,
+                            ];
+                            this.play_tonnetz_chord();
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child(graph_canvas);
+
+            // Build panel: graph + current chord + labeled neighbor list
+            let mut panel = div()
+                .id("neighbor-panel")
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .w(px(230.0))
+                .flex_shrink_0()
+                .p_2()
+                .rounded(px(6.0))
+                .bg(c_surface())
+                .border_1()
+                .border_color(c_border())
+                .overflow_y_scroll()
+                // Current chord
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(c_muted())
+                                        .child("CURRENT"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(c_accent_t())
+                                        .child(SharedString::from(cur_short_label)),
+                                ),
+                        )
+                        .child(
+                            Button::new("orb-play")
+                                .label("\u{266B}")
+                                .primary()
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.tonnetz_muted = false;
+                                    this.play_tonnetz_chord();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                // Mini-graph
+                .child(graph_container)
+                // Separator + neighbor list header
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(c_muted())
+                        .child(SharedString::from(format!(
+                            "NEIGHBORS ({})",
+                            neighbors.len()
+                        ))),
+                );
+
+            // Labeled clickable neighbor list (matches graph node colors)
+            // Get allowed types for dimming
+            let nb_allowed_types: Vec<&str> = self
+                .sc_active_profile
+                .and_then(|i| self.sc_profiles.get(i))
+                .map(|p| p.allowed_chord_types.clone())
+                .unwrap_or_default();
+
+            for (i, (idx, label, type_label, dist)) in neighbors.iter().enumerate() {
+                let target_idx = *idx;
+                let hue_f = graph_nodes.get(i).map(|n| n.3).unwrap_or(0.5);
+                let _short = nb_short_labels.get(i).cloned().unwrap_or_default();
+                let nb_chord = &self.tonnetz_state.nodes[target_idx].chord;
+                let nb_is_allowed = nb_allowed_types.is_empty()
+                    || nb_chord.n() < 3
+                    || nb_allowed_types.contains(&nb_chord.type_label());
+
+                // Dim blocked neighbors
+                let (bg_sat, bg_light, border_sat, dot_sat, dot_light, text_alpha) =
+                    if nb_is_allowed {
+                        (0.15, 0.12, 0.30, 0.65, 0.50, 1.0)
+                    } else {
+                        (0.05, 0.08, 0.10, 0.15, 0.25, 0.35)
+                    };
+
+                panel = panel.child(
+                    div()
+                        .id(SharedString::from(format!("nb-{target_idx}")))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(6.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(hsla(hue_f, bg_sat, bg_light, 1.0))
+                        .border_1()
+                        .border_color(hsla(hue_f, border_sat, 0.25, 0.5))
+                        .cursor(CursorStyle::PointingHand)
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            let old_idx = this.tonnetz_state.current_chord_idx;
+                            this.tonnetz_state.chord_trail.push_back(old_idx);
+                            if this.tonnetz_state.chord_trail.len() > 64 {
+                                this.tonnetz_state.chord_trail.pop_front();
+                            }
+                            this.prev_tonnetz_chord_idx = old_idx;
+                            this.tonnetz_state.current_chord_idx = target_idx;
+                            this.tonnetz_state.position = [
+                                this.tonnetz_state.nodes[target_idx].ox,
+                                this.tonnetz_state.nodes[target_idx].oy,
+                                this.tonnetz_state.nodes[target_idx].oz,
+                            ];
+                            this.play_tonnetz_chord();
+                            cx.notify();
+                        }))
+                        // Colored dot
+                        .child(
+                            div()
+                                .size(px(10.0))
+                                .rounded_full()
+                                .bg(hsla(hue_f, dot_sat, dot_light, 0.9))
+                                .flex_shrink_0(),
+                        )
+                        // Label
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hsla(hue_f, 0.70 * text_alpha, 0.72, text_alpha))
+                                        .child(SharedString::from(label.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(hsla(0.0, 0.0, 0.4, text_alpha))
+                                        .child(SharedString::from(format!(
+                                            "{}{}· d={dist:.1}",
+                                            type_label,
+                                            if nb_is_allowed { " " } else { " [blocked] " },
+                                        ))),
+                                ),
+                        ),
+                );
+            }
+
+            Some(panel)
+        } else {
+            None
+        };
+
+        // ── Controls row ──────────────────────────────────────────────────
         let nav_row = div()
             .flex()
             .items_center()
@@ -3842,16 +4567,6 @@ impl MindDaw {
                     })),
             )
             .child(
-                Button::new("orb-play")
-                    .label("\u{266B} Play")
-                    .primary()
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.tonnetz_muted = false;
-                        this.play_tonnetz_chord();
-                        cx.notify();
-                    })),
-            )
-            .child(
                 Button::new("orb-next")
                     .label("Next \u{25B6}")
                     .on_click(cx.listener(|this, _, _window, cx| {
@@ -3866,12 +4581,104 @@ impl MindDaw {
                         }
                     })),
             )
-            .child(mute_btn);
+            .child(mute_btn)
+            .child(manual_nav_btn);
 
+        // ── Sound profiles & SC controls ──────────────────────────────────
+        let sc_connected = self.sc_handle.is_some();
+        let active_profile = self.sc_active_profile;
+        let profile_names: Vec<(usize, &'static str, &'static str)> = self
+            .sc_profiles
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.name, p.description))
+            .collect();
+
+        let mut voice_row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                if sc_connected {
+                    Button::new("sc-toggle")
+                        .label("SC: On")
+                        .primary()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.sc_handle = None;
+                            cx.notify();
+                        }))
+                } else {
+                    Button::new("sc-toggle")
+                        .label("Connect SC")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.ensure_sc();
+                            cx.notify();
+                        }))
+                },
+            );
+
+        // Profile buttons
+        for (idx, name, _desc) in &profile_names {
+            let i = *idx;
+            let is_active = active_profile == Some(i);
+            let btn = if is_active {
+                Button::new(SharedString::from(format!("prof-{i}")))
+                    .label(*name)
+                    .primary()
+            } else {
+                Button::new(SharedString::from(format!("prof-{i}")))
+                    .label(*name)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.sc_active_profile = Some(i);
+                        let profile = this.sc_profiles[i].clone();
+                        this.sc_voice = profile.voice;
+                        this.sc_params = profile.params.clone();
+                        this.ensure_sc();
+                        // Start sequencer if profile has rhythm
+                        if let Some(ref h) = this.sc_handle {
+                            if profile.bpm > 0.0 && !profile.rhythm_pattern.is_empty() {
+                                let midi = this.tonnetz_state.current_chord()
+                                    .map(|c| crate::tonnetz::chord_to_midi_notes(c))
+                                    .unwrap_or_default();
+                                h.start_sequencer(profile, midi);
+                            } else {
+                                h.stop_sequencer();
+                                h.set_reverb(
+                                    profile.reverb_mix,
+                                    profile.reverb_room,
+                                    profile.reverb_damp,
+                                );
+                                this.play_tonnetz_chord();
+                            }
+                        }
+                        cx.notify();
+                    }))
+            };
+            voice_row = voice_row.child(btn);
+        }
+
+        // "None" button to deactivate profile
+        voice_row = voice_row.child(
+            if active_profile.is_none() {
+                Button::new("prof-none").label("Custom").primary()
+            } else {
+                Button::new("prof-none")
+                    .label("Custom")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.sc_active_profile = None;
+                        if let Some(ref h) = this.sc_handle {
+                            h.stop_sequencer();
+                        }
+                        cx.notify();
+                    }))
+            },
+        );
+
+        // ── Final layout ──────────────────────────────────────────────────
         div()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2()
             .child(
                 div()
                     .flex()
@@ -3885,7 +4692,7 @@ impl MindDaw {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(c_muted())
                                     .child("ORBIFOLD"),
                             )
                             .child(orb_row),
@@ -3893,8 +4700,21 @@ impl MindDaw {
                     .child(status),
             )
             .child(nav_row)
-            .child(orbifold_canvas)
-            .child(vl_section)
+            .child(voice_row)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(orbifold_canvas),
+                    )
+                    .children(neighbor_panel),
+            )
     }
 
     // ── Calibration ─────────────────────────────────────────────────────────
@@ -3910,7 +4730,6 @@ impl MindDaw {
         // Control state display
         let ctl = &self.control_state;
         let conf_c = ctl.confidence_continuous;
-        let conf_d = ctl.confidence_discrete;
         let motion_x = ctl.motion_x;
         let motion_y = ctl.motion_y;
         let tension = ctl.tension;
@@ -3987,18 +4806,43 @@ impl MindDaw {
         let mut btn_row = div().flex().gap_2();
 
         if step == calibration::CalibrationStep::Idle {
+            // Profile name input
+            btn_row = btn_row.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(c_muted())
+                            .child("Profile name:"),
+                    )
+                    .child(
+                        div()
+                            .w(px(150.0))
+                            .child(
+                                Input::new(&self.profile_name_input)
+                                    .small()
+                                    .cleanable(true),
+                            ),
+                    ),
+            );
             btn_row = btn_row.child(
                 Button::new("calib-start")
-                    .label("Full Calibration")
+                    .label("Start Calibration")
                     .primary()
                     .on_click(cx.listener(|this, _, _window, cx| {
-                        this.calibration_state.start();
-                        let name = if this.calibration_state.user_name.is_empty() {
-                            "default"
+                        // Read profile name from input
+                        let name = this.profile_name_input.read(cx).value().to_string();
+                        let name = if name.trim().is_empty() {
+                            "default".to_string()
                         } else {
-                            &this.calibration_state.user_name
+                            name.trim().to_string()
                         };
-                        this.session_log = Some(session_log::SessionLog::new(name));
+                        this.calibration_state.user_name = name.clone();
+                        this.calibration_state.start();
+                        this.session_log = Some(session_log::SessionLog::new(&name));
                         cx.notify();
                     })),
             );
@@ -4032,6 +4876,261 @@ impl MindDaw {
 
         col = col.child(btn_row);
 
+        // ── Action training UI ──────────────────────────────────────────
+        if step == calibration::CalibrationStep::ActionTraining {
+            let at = &self.calibration_state.action_training;
+            let is_running = at.running;
+            let cue = at.current_cue().to_string();
+            let cue_progress = at.cue_progress();
+            let can_train = at.can_train();
+            let model_trained = at.model_trained;
+            let total_trials = at.total_trials;
+
+            // Trial counts per action
+            let counts: Vec<(String, usize)> = at.trial_counts.iter()
+                .map(|(k, &v)| (k.clone(), v))
+                .collect();
+
+            let mut at_col = div().flex().flex_col().gap_3();
+
+            if !is_running {
+                // Action selection: show buttons to pick actions, then "Begin"
+                let mut action_row = div().flex().flex_wrap().gap_2();
+                for &action in calibration::TRAINABLE_ACTIONS {
+                    let a = action.to_string();
+                    action_row = action_row.child(
+                        Button::new(SharedString::from(format!("at-sel-{a}")))
+                            .label(SharedString::from(a.replace('_', " ")))
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                let sel = &mut this.calibration_state.action_training.selected_actions;
+                                let action_str = a.clone();
+                                if sel.contains(&action_str) {
+                                    sel.retain(|s| s != &action_str);
+                                } else {
+                                    sel.push(action_str);
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+
+                at_col = at_col
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(c_text())
+                            .child("Select actions to train, then press Begin:"),
+                    )
+                    .child(action_row);
+
+                // Show selected actions
+                let selected = self.calibration_state.action_training.selected_actions.clone();
+                if !selected.is_empty() {
+                    at_col = at_col.child(
+                        div()
+                            .text_sm()
+                            .text_color(c_accent_t())
+                            .child(SharedString::from(format!(
+                                "Selected: {}",
+                                selected.join(", ")
+                            ))),
+                    );
+                }
+
+                at_col = at_col.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("at-begin")
+                                .label("Begin Training")
+                                .primary()
+                                .disabled(selected.len() < 2)
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    let actions = this
+                                        .calibration_state
+                                        .action_training
+                                        .selected_actions
+                                        .clone();
+                                    this.calibration_state.start_action_training(actions);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("at-skip")
+                                .label("Skip")
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.calibration_state.skip_action_training();
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            } else {
+                // Running: show cue display, countdown, trial counts
+                let cue_color = if cue == "rest" {
+                    c_green()
+                } else {
+                    c_accent_t()
+                };
+                at_col = at_col.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .py_4()
+                        // Large cue label
+                        .child(
+                            div()
+                                .text_3xl()
+                                .font_weight(FontWeight::EXTRA_BOLD)
+                                .text_color(cue_color)
+                                .child(SharedString::from(cue.replace('_', " ").to_uppercase())),
+                        )
+                        // Countdown bar
+                        .child(
+                            div()
+                                .w(px(300.0))
+                                .h(px(8.0))
+                                .rounded(px(4.0))
+                                .bg(c_border())
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded(px(4.0))
+                                        .bg(cue_color)
+                                        .w(px(300.0 * cue_progress)),
+                                ),
+                        )
+                        // Trial count
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(c_muted())
+                                .child(SharedString::from(format!(
+                                    "{total_trials} trials recorded"
+                                ))),
+                        ),
+                );
+
+                // Per-class trial counts
+                let mut count_row = div().flex().flex_wrap().gap_2();
+                for (label, count) in &counts {
+                    let min_needed = crate::recorder::fbcsp::MIN_EPOCHS;
+                    let color = if *count >= min_needed {
+                        c_green()
+                    } else {
+                        c_muted()
+                    };
+                    count_row = count_row.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(4.0))
+                            .bg(c_surface())
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(color)
+                                    .child(SharedString::from(format!(
+                                        "{}: {}/{}",
+                                        label.replace('_', " "),
+                                        count,
+                                        min_needed
+                                    ))),
+                            ),
+                    );
+                }
+                at_col = at_col.child(count_row);
+
+                // Control buttons
+                let mut ctrl_row = div().flex().gap_2();
+                if can_train {
+                    ctrl_row = ctrl_row.child(
+                        Button::new("at-train")
+                            .label("Train FBCSP")
+                            .primary()
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                // Clone trials for background training
+                                let trials = this
+                                    .calibration_state
+                                    .action_training
+                                    .trials
+                                    .clone();
+                                eprintln!(
+                                    "[calibration] training FBCSP on {} trials (background)...",
+                                    trials.len()
+                                );
+
+                                // Run training on a background thread
+                                cx.spawn(async move |this, cx| {
+                                    let model = smol::unblock(move || {
+                                        recorder::fbcsp::FbcspModel::train(&trials, 300.0)
+                                    })
+                                    .await;
+
+                                    this.update(cx, |this, cx| {
+                                        match model {
+                                            Some(m) => {
+                                                eprintln!(
+                                                    "[calibration] FBCSP trained: {} classes, {} features",
+                                                    m.labels.len(),
+                                                    m.n_features()
+                                                );
+                                                this.rec.fbcsp_model = Some(m.clone());
+                                                this.calibration_state.action_training.trained_model =
+                                                    Some(m);
+                                                this.calibration_state.action_training.model_trained =
+                                                    true;
+                                            }
+                                            None => {
+                                                eprintln!(
+                                                    "[calibration] FBCSP training failed"
+                                                );
+                                            }
+                                        }
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                })
+                                .detach();
+                                cx.notify();
+                            })),
+                    );
+                }
+                if model_trained {
+                    ctrl_row = ctrl_row.child(
+                        div()
+                            .text_sm()
+                            .text_color(c_green())
+                            .child("Model trained"),
+                    );
+                }
+                ctrl_row = ctrl_row.child(
+                    Button::new("at-finish")
+                        .label("Finish & Continue")
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            // Copy trained model to recorder
+                            if let Some(ref m) =
+                                this.calibration_state.action_training.trained_model
+                            {
+                                this.rec.fbcsp_model = Some(m.clone());
+                            }
+                            this.calibration_state.finish_action_training();
+                            cx.notify();
+                        })),
+                );
+
+                at_col = at_col.child(ctrl_row);
+            }
+
+            col = col.child(at_col);
+        }
+
         // ── Load existing profiles ───────────────────────────────────────
         if !profiles.is_empty() && step == calibration::CalibrationStep::Idle {
             let mut profile_row = div()
@@ -4052,6 +5151,13 @@ impl MindDaw {
                         .label(SharedString::from(name))
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.calibration_state.load_profile(&name_clone);
+                            // Load saved FBCSP model if present
+                            if let Some(ref profile) = this.calibration_state.profile {
+                                if let Some(ref model) = profile.trained_model {
+                                    this.rec.fbcsp_model = Some(model.clone());
+                                    eprintln!("[profile] loaded FBCSP model: {} classes", model.labels.len());
+                                }
+                            }
                             // Start session logging with loaded profile
                             this.session_log = Some(session_log::SessionLog::new(&name_clone));
                             if let Some(ref mut log) = this.session_log {
@@ -4064,7 +5170,24 @@ impl MindDaw {
             col = col.child(profile_row);
         }
 
-        // ── Channel quality display ───────────────────────────────────────
+        // ── Channel quality display (only during active calibration) ─────
+        let is_active_step = step != calibration::CalibrationStep::Idle
+            && step != calibration::CalibrationStep::Complete;
+        if !is_active_step {
+            // On Idle/Complete, just show a compact summary
+            if has_profile {
+                col = col.child(
+                    div()
+                        .text_sm()
+                        .text_color(c_green())
+                        .child(format!(
+                            "Profile loaded: {} ({} channels usable)",
+                            profile_name, good_count
+                        )),
+                );
+            }
+            return col;
+        }
         col = col.child(
             div()
                 .text_sm()
@@ -4073,29 +5196,48 @@ impl MindDaw {
                 .child(format!("Channels: {}/{} usable", good_count, n_channels)),
         );
 
-        // Per-channel quality indicators (green/yellow/red dots as text)
+        // Per-channel quality grid (colored rectangles)
         {
-            let mut ch_row = String::new();
-            for (i, d) in self.calibration_state.channel_diag.iter().enumerate() {
-                if i > 0 && i % 16 == 0 { ch_row.push('\n'); }
-                let symbol = if d.flat {
-                    '_'  // flat/disconnected
-                } else if d.quality > 0.6 {
-                    'G'  // green / good
-                } else if d.quality > 0.3 {
-                    'Y'  // yellow / marginal
-                } else {
-                    'R'  // red / bad
-                };
-                ch_row.push(symbol);
-                ch_row.push(' ');
-            }
-            col = col.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(ch_row),
-            );
+            let diag_data: Vec<(f32, bool)> = self.calibration_state.channel_diag
+                .iter().map(|d| (d.quality, d.flat)).collect();
+            let rows = ((n_channels + 15) / 16) as f32;
+            let ch_canvas = canvas(
+                move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| { bounds },
+                move |_actual: Bounds<Pixels>,
+                      bounds: Bounds<Pixels>,
+                      window: &mut Window,
+                      _cx: &mut App| {
+                    let cell = 10.0f32;
+                    let gap = 2.0f32;
+                    let ox: f32 = bounds.origin.x.into();
+                    let oy: f32 = bounds.origin.y.into();
+                    for (i, &(quality, flat)) in diag_data.iter().enumerate() {
+                        let col_i = i % 16;
+                        let row_i = i / 16;
+                        let x = ox + col_i as f32 * (cell + gap);
+                        let y = oy + row_i as f32 * (cell + gap);
+                        let color = if flat {
+                            gpui::hsla(0.0, 0.0, 0.15, 1.0)
+                        } else if quality > 0.6 {
+                            gpui::hsla(0.33, 0.8, 0.45, 1.0)
+                        } else if quality > 0.3 {
+                            gpui::hsla(0.13, 0.8, 0.5, 1.0)
+                        } else {
+                            gpui::hsla(0.0, 0.75, 0.45, 1.0)
+                        };
+                        window.paint_quad(gpui::fill(
+                            Bounds::new(
+                                point(px(x), px(y)),
+                                size(px(cell), px(cell)),
+                            ),
+                            color,
+                        ));
+                    }
+                },
+            )
+            .w(px(16.0 * 12.0))
+            .h(px(rows * 12.0));
+            col = col.child(ch_canvas);
         }
 
         // Warnings
@@ -4108,50 +5250,30 @@ impl MindDaw {
             );
         }
 
-        // ── Live Control State display ───────────────────────────────────
-        col = col.child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(cx.theme().foreground)
-                .mt_2()
-                .child("Live Control State"),
-        );
-
-        let control_info = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(format!(
-                "Motion:     ({:+.2}, {:+.2})", motion_x, motion_y
-            ))
-            .child(format!("Tension:    {:.2}", tension))
-            .child(format!("Stability:  {:.2}", stability))
-            .child(format!("Confidence: c={:.2} d={:.2}", conf_c, conf_d))
-            .child(format!("Freeze:     {}", if freeze { "ON" } else { "off" }));
-
-        col = col.child(control_info);
-
-        // ── Motion + confidence visualization (canvas) ───────────────────
+        // ── Control state visualization ─────────────────────────────────
         let mx = motion_x;
         let my = motion_y;
         let cc = conf_c;
         let tn = tension;
         let st = stability;
+        let fz = freeze;
         let motion_canvas = canvas(
             move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
-                bounds // pass bounds through to paint
+                bounds
             },
             move |_actual_bounds: Bounds<Pixels>,
                   bounds: Bounds<Pixels>,
                   window: &mut Window,
                   _cx: &mut App| {
                 // Background
-                window.paint_quad(gpui::fill(bounds, gpui::hsla(0.0, 0.0, 0.06, 1.0)));
+                window.paint_quad(gpui::fill(bounds, c_canvas()));
+                let border_color = if fz {
+                    gpui::hsla(0.55, 0.8, 0.5, 0.8) // cyan border when frozen
+                } else {
+                    gpui::hsla(0.0, 0.0, 0.2, 1.0)
+                };
                 window.paint_quad(gpui::outline(
-                    bounds, gpui::hsla(0.0, 0.0, 0.2, 1.0), gpui::BorderStyle::Solid,
+                    bounds, border_color, gpui::BorderStyle::Solid,
                 ));
 
                 let w: f32 = bounds.size.width.into();
@@ -4220,24 +5342,34 @@ impl MindDaw {
         .w(px(160.0))
         .h(px(160.0));
 
+        let mut legend = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child("X: relaxation (α/β)")
+            .child("Y: arousal (θ)")
+            .child("Bottom: tension")
+            .child("Right: stability")
+            .child(format!("Confidence {:.0}%", conf_c * 100.0));
+        if freeze {
+            legend = legend.child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(gpui::hsla(0.55, 0.8, 0.6, 1.0))
+                    .child("FROZEN"),
+            );
+        }
+
         col = col.child(
             div()
                 .flex()
                 .gap_4()
+                .mt_2()
                 .child(motion_canvas)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("X: relaxation (alpha/beta)")
-                        .child("Y: arousal (theta)")
-                        .child("Bottom bar: tension")
-                        .child("Right bar: stability")
-                        .child(format!("Dot size = confidence ({:.0}%)", conf_c * 100.0)),
-                ),
+                .child(legend),
         );
 
         // ── Live Detection ────────────────────────────────────────────────
@@ -4998,8 +6130,9 @@ impl MindDaw {
                 .primary()
                 .label("▶ Start Prediction")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    // Force retrain before starting
+                    // Force retrain before starting (both classifiers)
                     this.rec.classifier = TrainedClassifier::train(&this.rec.session.epochs);
+                    this.rec_train_fbcsp();
                     this.rec.mode = RecorderMode::Predicting;
                     cx.notify();
                 }))
@@ -6031,10 +7164,10 @@ fn pca_sphere_canvas(
             let bounds = state.bounds;
 
             // Dark background + outline
-            window.paint_quad(gpui::fill(bounds, gpui::hsla(0.0, 0.0, 0.06, 1.0)));
+            window.paint_quad(gpui::fill(bounds, c_canvas()));
             window.paint_quad(gpui::outline(
                 bounds,
-                gpui::hsla(0.0, 0.0, 0.2, 1.0),
+                c_border(),
                 gpui::BorderStyle::Solid,
             ));
 
@@ -6129,14 +7262,22 @@ fn pca_sphere_canvas(
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    let demo_mode = std::env::args().any(|a| a == "--demo");
+
+    Application::new().run(move |cx: &mut App| {
         gpui_component::init(cx);
         gpui_component::theme::Theme::change(gpui_component::theme::ThemeMode::Dark, None, cx);
 
         cx.open_window(WindowOptions::default(), |window, cx| {
             let stimulus_input = cx.new(|cx| InputState::new(window, cx).placeholder("new stimulus…"));
             let profile_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("profile name…"));
-            let view = cx.new(|_cx| MindDaw::new(stimulus_input, profile_name_input));
+            let view = cx.new(|cx| {
+                let mut daw = MindDaw::new(stimulus_input, profile_name_input);
+                if demo_mode {
+                    daw.cog_demo(cx);
+                }
+                daw
+            });
             cx.new(|cx| Root::new(view, window, cx))
         })
         .unwrap();
