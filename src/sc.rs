@@ -744,28 +744,22 @@ fn sc_worker_loop(server: Server, cmd_rx: mpsc::Receiver<ScCommand>) {
                     }
                 }
 
-                // ── Melodic note — voice and params vary by section ──
-                let midi = seq.next_note();
+                // ── Full chord — all notes simultaneously ──
                 let vel = seq.current_velocity();
-                let pan = seq.rand_pan();
                 let section = seq.section;
 
-                // Section + EEG determine voice.
-                // High stability → ethereal/glass; high tension → base voice;
-                // low confidence → stick with time-based sections.
+                // EEG/section-driven voice selection
                 let (def_name, octave_shift): (&str, i32) = if seq.confidence > 0.3 {
-                    // EEG-driven voice selection
                     if seq.stability > 0.6 {
-                        ("mglass", 12) // calm, stable → ethereal glass, octave up
+                        ("mglass", 12)
                     } else if seq.tension > 0.5 {
-                        (seq.profile.voice.sc_name(), 0) // tense → punchy base voice
+                        (seq.profile.voice.sc_name(), 0)
                     } else if seq.motion_y > 0.2 {
-                        (seq.profile.voice.sc_name(), -12) // deep/theta → octave down
+                        (seq.profile.voice.sc_name(), -12)
                     } else {
-                        ("mbell", 0) // neutral → bell chimes
+                        ("mbell", 0)
                     }
                 } else {
-                    // Autopilot: time-based sections
                     match section {
                         0 => (seq.profile.voice.sc_name(), 0),
                         1 => ("mglass", 12),
@@ -774,77 +768,90 @@ fn sc_worker_loop(server: Server, cmd_rx: mpsc::Receiver<ScCommand>) {
                     }
                 };
 
-                let shifted_midi = (midi as i32 + octave_shift).clamp(24, 108) as u8;
-                let freq = 440.0_f32
-                    * (2.0_f32).powf((shifted_midi as f32 - 69.0) / 12.0);
-                let node_id = next_node_id;
-                next_node_id += 1;
-                if next_node_id > 9000 { next_node_id = NODE_ID_BASE; }
-
                 let ffreq = seq.profile.params.filter_freq
                     * (0.5 + seq.stability * 1.5);
-
-                // Section-dependent amplitude (quieter in ethereal sections)
                 let section_amp = match section {
-                    1 => seq.profile.params.amp * 0.6, // bells quieter
-                    3 => seq.profile.params.amp * 0.8, // pluck slightly quieter
+                    1 => seq.profile.params.amp * 0.6,
+                    3 => seq.profile.params.amp * 0.8,
                     _ => seq.profile.params.amp,
                 };
 
-                let mut controls = vec![
-                    Control::new("freq", freq),
-                    Control::new("amp", section_amp * vel),
-                    Control::new("pan", pan),
-                ];
+                // EEG: low stability → skip this chord hit (rest)
+                let play_chord = seq.stability > 0.2 || seq.rng_f32() > 0.5;
 
-                // Voice-specific params
-                match def_name {
-                    "mpad" | "mdrone" | "mshimmer" => {
-                        controls.extend_from_slice(&[
-                            Control::new("ffreq", ffreq),
-                            Control::new("atk", seq.profile.params.attack),
-                            Control::new("rel", seq.profile.params.release),
-                            Control::new("detune", seq.profile.params.detune),
-                            Control::new("gate", 1.0_f32),
-                        ]);
+                if play_chord {
+                    let chord_notes = seq.midi_notes.clone();
+                    let n_notes = chord_notes.len().max(1);
+                    for &midi in &chord_notes {
+                        let shifted = (midi as i32 + octave_shift).clamp(24, 108) as u8;
+                        let freq = 440.0_f32
+                            * (2.0_f32).powf((shifted as f32 - 69.0) / 12.0);
+                        let node_id = next_node_id;
+                        next_node_id += 1;
+                        if next_node_id > 9000 { next_node_id = NODE_ID_BASE; }
+
+                        let pan = if seq.profile.random_pan {
+                            seq.rand_pan()
+                        } else {
+                            0.0
+                        };
+
+                        let mut controls = vec![
+                            Control::new("freq", freq),
+                            Control::new("amp", section_amp * vel / n_notes as f32),
+                            Control::new("pan", pan),
+                        ];
+
+                        match def_name {
+                            "mpad" | "mdrone" | "mshimmer" => {
+                                controls.extend_from_slice(&[
+                                    Control::new("ffreq", ffreq),
+                                    Control::new("atk", seq.profile.params.attack),
+                                    Control::new("rel", seq.profile.params.release),
+                                    Control::new("detune", seq.profile.params.detune),
+                                    Control::new("gate", 1.0_f32),
+                                ]);
+                            }
+                            "mrcpluck" | "mlofi" => {
+                                controls.extend_from_slice(&[
+                                    Control::new("vel", vel),
+                                    Control::new("fbase", ffreq),
+                                    Control::new("fdecay", 0.3_f32),
+                                    Control::new("vdecay", seq.profile.params.duration),
+                                ]);
+                            }
+                            "mpluck" => {
+                                controls.extend_from_slice(&[
+                                    Control::new("dur", seq.profile.params.duration * 1.5),
+                                    Control::new("coef", 0.15_f32),
+                                ]);
+                            }
+                            "mbell" => {
+                                controls.push(Control::new("dur", 2.5_f32));
+                            }
+                            "mpulse" => {
+                                controls.push(Control::new("dur", 0.15_f32));
+                            }
+                            "mglass" => {
+                                controls.extend_from_slice(&[
+                                    Control::new("ffreq", ffreq * 3.0),
+                                    Control::new("atk", 2.0_f32),
+                                    Control::new("rel", 4.0_f32),
+                                    Control::new("gate", 1.0_f32),
+                                ]);
+                            }
+                            _ => {}
+                        }
+
+                        let _ = server.send(
+                            SynthNew::new(def_name, GROUP_SOURCES)
+                                .synth_id(node_id)
+                                .add_action(AddAction::HeadOfGroup)
+                                .controls(controls),
+                        );
                     }
-                    "mrcpluck" | "mlofi" => {
-                        controls.extend_from_slice(&[
-                            Control::new("vel", vel),
-                            Control::new("fbase", ffreq),
-                            Control::new("fdecay", 0.3_f32),
-                            Control::new("vdecay", seq.profile.params.duration),
-                        ]);
-                    }
-                    "mpluck" => {
-                        controls.extend_from_slice(&[
-                            Control::new("dur", seq.profile.params.duration * 1.5),
-                            Control::new("coef", 0.15_f32),
-                        ]);
-                    }
-                    "mbell" => {
-                        controls.push(Control::new("dur", 2.5_f32));
-                    }
-                    "mpulse" => {
-                        controls.push(Control::new("dur", 0.15_f32));
-                    }
-                    "mglass" => {
-                        controls.extend_from_slice(&[
-                            Control::new("ffreq", ffreq * 3.0),
-                            Control::new("atk", 2.0_f32),
-                            Control::new("rel", 4.0_f32),
-                            Control::new("gate", 1.0_f32),
-                        ]);
-                    }
-                    _ => {}
                 }
-
-                let _ = server.send(
-                    SynthNew::new(def_name, GROUP_SOURCES)
-                        .synth_id(node_id)
-                        .add_action(AddAction::HeadOfGroup)
-                        .controls(controls),
-                );
+                seq.note_idx += 1; // still advance for phrase tracking
 
                 seq.advance();
             }

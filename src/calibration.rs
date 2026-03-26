@@ -424,6 +424,10 @@ pub struct CalibrationState {
 
     /// Cued-trial action training state.
     pub action_training: ActionTrainingState,
+
+    /// Set to true when a step completes that the user can't see
+    /// (eyes closed, etc.) — the UI should play an audible cue.
+    pub play_step_done_tone: bool,
 }
 
 impl CalibrationState {
@@ -458,6 +462,7 @@ impl CalibrationState {
             warnings: Vec::new(),
             available_profiles: CalibrationProfile::list_profiles(),
             action_training: ActionTrainingState::default(),
+            play_step_done_tone: false,
         }
     }
 
@@ -792,6 +797,15 @@ impl CalibrationState {
                 RefreshStep::Idle           => CalibrationStep::Idle,
             };
         } else {
+            // Play a tone when eyes-closed steps end (user can't see the screen)
+            let needs_tone = matches!(
+                self.step,
+                CalibrationStep::RestingEyesClosed | CalibrationStep::ExpressionRelaxed
+            );
+            if needs_tone {
+                self.play_step_done_tone = true;
+            }
+
             match self.step {
                 CalibrationStep::SignalQuality     => self.compute_signal_quality(),
                 CalibrationStep::RestingEyesOpen   => self.compute_resting_baseline(true),

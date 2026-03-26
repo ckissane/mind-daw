@@ -200,6 +200,7 @@ fn permute_inner(perm: &mut Vec<usize>, k: usize, f: &mut impl FnMut(&[usize])) 
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum OrbifoldType {
+    Notes,   // T¹/S₁ — circle of 12 pitch classes
     Dyads,   // T²/S₂ — Möbius strip
     Triads,  // T³/S₃
 }
@@ -207,6 +208,7 @@ pub enum OrbifoldType {
 impl OrbifoldType {
     pub fn n(self) -> usize {
         match self {
+            Self::Notes => 1,
             Self::Dyads => 2,
             Self::Triads => 3,
         }
@@ -214,6 +216,7 @@ impl OrbifoldType {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Notes => "T\u{00B9}/S\u{2081} Notes",
             Self::Dyads => "T\u{00B2}/S\u{2082} Dyads",
             Self::Triads => "T\u{00B3}/S\u{2083} Triads",
         }
@@ -227,6 +230,10 @@ impl OrbifoldType {
     /// Generate the set of chords for this orbifold.
     pub fn chords(self) -> Vec<Chord> {
         match self {
+            Self::Notes => {
+                // All 12 pitch classes as single-note "chords"
+                (0..12u8).map(|p| Chord::new(vec![p as f32])).collect()
+            }
             Self::Dyads => {
                 // All 78 unordered pairs in T²/S₂ (including 12 unisons on the boundary)
                 let mut out = Vec::new();
@@ -345,6 +352,12 @@ pub struct TonnetzNode {
 /// Triads: uses the same folded prism layout as triad_prism_layout.
 fn chord_to_3d(chord: &Chord, orbifold: OrbifoldType) -> (f32, f32, f32) {
     match orbifold {
+        OrbifoldType::Notes => {
+            // Place on a circle: angle = pc * 2π/12, radius = 1
+            let pc = chord.pcs[0];
+            let angle = pc * std::f32::consts::TAU / 12.0;
+            (angle.cos(), angle.sin(), 0.0)
+        }
         OrbifoldType::Dyads => {
             let (ox, oy) = mobius_strip_layout(chord);
             (ox, oy, 0.0)
@@ -504,6 +517,7 @@ pub struct TonnetzEdge {
 pub fn build_graph(orbifold: OrbifoldType) -> (Vec<TonnetzNode>, Vec<TonnetzEdge>) {
     let chords = orbifold.chords();
     let threshold = match orbifold {
+        OrbifoldType::Notes => 1.5,  // semitone neighbors
         OrbifoldType::Dyads => 2.0,
         OrbifoldType::Triads => 2.5,
     };

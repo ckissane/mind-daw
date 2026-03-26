@@ -1132,7 +1132,7 @@ impl MindDaw {
                             // Actions map to voice-leading types, not spatial directions.
                             // Debounce: at most one jump per 400 ms.
                             if this.tonnetz_manual_nav
-                                && this.last_action_nav.elapsed().as_secs_f32() > 0.4
+                                && this.last_action_nav.elapsed().as_secs_f32() > 2.0
                             {
                                 let mut nav_kind: Option<tonnetz::VoiceLeadingKind> = None;
 
@@ -1241,6 +1241,37 @@ impl MindDaw {
                         this.calibration_state.feed_raw_bufs(
                             &this.cog_buffer, 0.033,
                         );
+                        // Play audible tone when eyes-closed steps end
+                        if this.calibration_state.play_step_done_tone {
+                            this.calibration_state.play_step_done_tone = false;
+                            // Play a simple bell tone via SC or soundboard
+                            if let Some(ref h) = this.sc_handle {
+                                h.play_chord(
+                                    vec![72, 76, 79], // C5 major chord
+                                    sc::Voice::Bell,
+                                    sc::ChordParams {
+                                        amp: 0.25,
+                                        duration: 1.5,
+                                        ..sc::ChordParams::default()
+                                    },
+                                    false,
+                                );
+                            } else {
+                                // Fallback: built-in soundboard beep
+                                this.sb_ensure_engine();
+                                if let Some(ref h) = this.soundboard_handle {
+                                    let _ = h.cmd_tx.try_send(
+                                        soundboard::SbCommand::PlayNote {
+                                            midi: 72,
+                                            waveform: soundboard::SbWaveform::Sine,
+                                            instrument: soundboard::SbInstrument::Piano,
+                                            chord: soundboard::SbChord::Single,
+                                            volume: 0.3,
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         // Feed action training protocol (cued trials for FBCSP)
                         this.calibration_state.feed_action_training(
                             &this.cog_buffer, 0.033,
@@ -3554,6 +3585,7 @@ impl MindDaw {
 
         // ── Orbifold selector ────────────────────────────────────────────────
         let orbifold_types = [
+            tonnetz::OrbifoldType::Notes,
             tonnetz::OrbifoldType::Dyads,
             tonnetz::OrbifoldType::Triads,
         ];
@@ -3594,6 +3626,7 @@ impl MindDaw {
         };
 
         let orb_label = match orbifold {
+            tonnetz::OrbifoldType::Notes => "T\u{00B9}/S\u{2081}",
             tonnetz::OrbifoldType::Dyads => "T\u{00B2}/S\u{2082}",
             tonnetz::OrbifoldType::Triads => "T\u{00B3}/S\u{2083}",
         };
@@ -3653,6 +3686,7 @@ impl MindDaw {
 
         let trail: Vec<usize> = state.chord_trail.iter().copied().collect();
         let is_dyads = orbifold == tonnetz::OrbifoldType::Dyads;
+        let is_notes = orbifold == tonnetz::OrbifoldType::Notes;
         let yaw = state.yaw;
         let pitch_angle = state.pitch;
         let zoom = state.zoom;
@@ -3680,7 +3714,120 @@ impl MindDaw {
                 let hues: [f32; 6] = [0.58, 0.75, 0.0, 0.15, 0.45, 0.5];
                 let margin = 50.0f32;
 
-                if is_dyads {
+                if is_notes {
+                    // ── T¹/S₁: circle of 12 pitch classes ───────────────
+                    let radius = (w.min(h) / 2.0 - margin) * 0.75;
+                    let cx0 = bx + w / 2.0;
+                    let cy0 = by + h / 2.0;
+
+                    // Draw the circle outline
+                    let n_seg = 120;
+                    let mut circle_pb = PathBuilder::stroke(px(1.5));
+                    for s in 0..=n_seg {
+                        let theta = s as f32 * std::f32::consts::TAU / n_seg as f32;
+                        let sx = cx0 + radius * theta.cos();
+                        let sy = cy0 - radius * theta.sin();
+                        if s == 0 {
+                            circle_pb.move_to(point(px(sx), px(sy)));
+                        } else {
+                            circle_pb.line_to(point(px(sx), px(sy)));
+                        }
+                    }
+                    if let Ok(path) = circle_pb.build() {
+                        window.paint_path(path, gpui::hsla(0.6, 0.4, 0.4, 0.4));
+                    }
+
+                    // Position each note on the circle: C at top, clockwise
+                    let note_pos = |pc: f32| -> (f32, f32) {
+                        // Start at top (π/2), go clockwise
+                        let angle = std::f32::consts::FRAC_PI_2
+                            - pc * std::f32::consts::TAU / 12.0;
+                        (cx0 + radius * angle.cos(), cy0 - radius * angle.sin())
+                    };
+
+                    // Edges
+                    for &(from, to, dist) in &edges {
+                        if let (Some(&(_, _, _, _, c1, _)), Some(&(_, _, _, _, c2, _))) =
+                            (node_data.get(from), node_data.get(to))
+                        {
+                            let from_pc = from as f32;
+                            let to_pc = to as f32;
+                            let (x1, y1) = note_pos(from_pc);
+                            let (x2, y2) = note_pos(to_pc);
+                            let alpha = if c1 || c2 { 0.5 } else {
+                                (0.08 + 0.15 * (1.0 - dist / 2.0).max(0.0)).min(0.25)
+                            };
+                            let hue = if c1 || c2 { 0.33 } else { 0.58 };
+                            let mut builder = PathBuilder::stroke(px(if c1 || c2 { 1.5 } else { 0.5 }));
+                            builder.move_to(point(px(x1), px(y1)));
+                            builder.line_to(point(px(x2), px(y2)));
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, gpui::hsla(hue, 0.5, 0.5, alpha));
+                            }
+                        }
+                    }
+
+                    // Trail
+                    for pair in trail.windows(2) {
+                        let (x1, y1) = note_pos(pair[0] as f32);
+                        let (x2, y2) = note_pos(pair[1] as f32);
+                        let mut builder = PathBuilder::stroke(px(1.5));
+                        builder.move_to(point(px(x1), px(y1)));
+                        builder.line_to(point(px(x2), px(y2)));
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, gpui::hsla(0.08, 0.9, 0.6, 0.5));
+                        }
+                    }
+
+                    // Nodes — draw each note
+                    let note_names = ["C", "C#", "D", "Eb", "E", "F",
+                                      "F#", "G", "Ab", "A", "Bb", "B"];
+                    for (i, &(_, _, _, hue_idx, is_current, is_allowed)) in
+                        node_data.iter().enumerate()
+                    {
+                        let (x, y) = note_pos(i as f32);
+                        let sz = if is_current { 28.0 } else { 20.0 };
+                        let nb = Bounds {
+                            origin: point(px(x - sz / 2.0), px(y - sz / 2.0)),
+                            size: size(px(sz), px(sz)),
+                        };
+                        if is_current {
+                            let gs = 38.0;
+                            let glow = Bounds {
+                                origin: point(px(x - gs / 2.0), px(y - gs / 2.0)),
+                                size: size(px(gs), px(gs)),
+                            };
+                            window.paint_quad(gpui::fill(glow, gpui::hsla(0.33, 0.9, 0.6, 0.25)));
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(0.33, 0.9, 0.7, 1.0)));
+                        } else if is_allowed {
+                            let hue = hues[hue_idx as usize % hues.len()];
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(hue, 0.6, 0.5, 0.7)));
+                        } else {
+                            window.paint_quad(gpui::fill(nb, gpui::hsla(0.0, 0.0, 0.2, 0.3)));
+                        }
+
+                        // Draw note name label outside the circle
+                        let label_r = radius + 22.0;
+                        let angle = std::f32::consts::FRAC_PI_2
+                            - i as f32 * std::f32::consts::TAU / 12.0;
+                        let lx = cx0 + label_r * angle.cos();
+                        let ly = cy0 - label_r * angle.sin();
+                        let name = note_names[i % 12];
+                        let label_color = if is_current {
+                            gpui::hsla(0.33, 0.9, 0.8, 1.0)
+                        } else {
+                            gpui::hsla(0.0, 0.0, 0.6, 0.9)
+                        };
+                        let tw = if name.len() > 1 { 14.0 } else { 8.0 };
+                        window.paint_quad(gpui::fill(
+                            Bounds {
+                                origin: point(px(lx - tw / 2.0), px(ly - 6.0)),
+                                size: size(px(tw), px(12.0)),
+                            },
+                            label_color,
+                        ));
+                    }
+                } else if is_dyads {
                     // ── T²/S₂: Möbius strip [0,6]×[0,12] as square ──────
                     let side = (w - 2.0 * margin).min(h - 2.0 * margin);
                     let cx0 = bx + w / 2.0;
@@ -4051,8 +4198,8 @@ impl MindDaw {
         .w_full()
         .h(px(500.0));
 
-        // For triads: wrap canvas with mouse drag for 3D rotation
-        let orbifold_canvas = if !is_dyads {
+        // Wrap canvas with appropriate interaction handler
+        let orbifold_canvas = if !is_dyads && !is_notes {
             div()
                 .id("triad-canvas-interact")
                 .cursor(CursorStyle::PointingHand)
@@ -4106,6 +4253,71 @@ impl MindDaw {
                         (this.tonnetz_state.zoom * (1.0 + dy * 0.1)).clamp(0.3, 5.0);
                     cx.notify();
                 }))
+                .child(orbifold_canvas)
+        } else if is_notes {
+            // Notes: wrap canvas with click-to-select-note handler.
+            div()
+                .id("notes-canvas-click")
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if !this.tonnetz_manual_nav {
+                            return;
+                        }
+                        // Compute circle layout from the canvas element bounds
+                        let bounds = window.bounds();
+                        let w: f32 = bounds.size.width.into();
+                        let h: f32 = bounds.size.height.into();
+                        let bx: f32 = bounds.origin.x.into();
+                        let by: f32 = bounds.origin.y.into();
+                        let margin = 50.0_f32;
+                        let radius = (w.min(h) / 2.0 - margin) * 0.75;
+                        let ccx = bx + w / 2.0;
+                        let ccy = by + h / 2.0;
+
+                        let mx: f32 = event.position.x.into();
+                        let my: f32 = event.position.y.into();
+
+                        // Convert click to angle relative to circle center
+                        let dx = mx - ccx;
+                        let dy = -(my - ccy); // flip y (screen y goes down)
+                        let click_angle = dy.atan2(dx); // in [-π, π], 0=right, π/2=up
+                        // Convert angle to pitch class: C=0 is at π/2, clockwise
+                        let pc = ((std::f32::consts::FRAC_PI_2 - click_angle)
+                            .rem_euclid(std::f32::consts::TAU)
+                            / std::f32::consts::TAU
+                            * 12.0)
+                            .round() as usize
+                            % 12;
+
+                        // Check distance from circle
+                        let dist_from_center = (dx * dx + dy * dy).sqrt();
+                        if (dist_from_center - radius).abs() > radius * 0.4 {
+                            return;
+                        }
+
+                        let target = pc;
+                        if target < this.tonnetz_state.nodes.len() {
+                            let old = this.tonnetz_state.current_chord_idx;
+                            if target != old {
+                                this.tonnetz_state.chord_trail.push_back(old);
+                                if this.tonnetz_state.chord_trail.len() > 64 {
+                                    this.tonnetz_state.chord_trail.pop_front();
+                                }
+                            }
+                            this.prev_tonnetz_chord_idx = old;
+                            this.tonnetz_state.current_chord_idx = target;
+                            this.tonnetz_state.position = [
+                                this.tonnetz_state.nodes[target].ox,
+                                this.tonnetz_state.nodes[target].oy,
+                                this.tonnetz_state.nodes[target].oz,
+                            ];
+                            this.play_tonnetz_chord();
+                            cx.notify();
+                        }
+                    }),
+                )
                 .child(orbifold_canvas)
         } else {
             // Dyads: wrap canvas with click-to-navigate handler.
