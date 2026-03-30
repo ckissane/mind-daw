@@ -374,6 +374,7 @@ fn chord_to_3d(chord: &Chord, orbifold: OrbifoldType) -> (f32, f32, f32) {
 /// Rather than mapping actions to arbitrary spatial directions, we classify
 /// each edge by what its optimal voice leading *does* and let actions choose
 /// among these musically meaningful move types.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VoiceLeadingKind {
     /// Transpose everything up: all voices rise.
@@ -394,6 +395,7 @@ pub enum VoiceLeadingKind {
 ///
 /// Returns a vector of per-voice signed semitone displacements (shortest path
 /// on the pitch-class circle) under the permutation that minimises L2 distance.
+#[allow(dead_code)]
 fn optimal_voice_leading(a: &Chord, b: &Chord) -> Vec<f32> {
     let n = a.n();
     if n != b.n() || n == 0 {
@@ -445,6 +447,7 @@ fn optimal_voice_leading(a: &Chord, b: &Chord) -> Vec<f32> {
 
 /// Signed shortest-path distance on the pitch-class circle.
 /// Positive = upward motion, negative = downward.
+#[allow(dead_code)]
 fn signed_pc_dist(from: f32, to: f32) -> f32 {
     let d = (to - from).rem_euclid(12.0);
     if d <= 6.0 { d } else { d - 12.0 }
@@ -455,6 +458,7 @@ fn signed_pc_dist(from: f32, to: f32) -> f32 {
 /// Returns a positive score for good matches, ≤ 0 for non-matches.
 /// Among all neighbors of the current chord, the one with the highest score
 /// for the requested kind is chosen.
+#[allow(dead_code)]
 fn score_voice_leading(a: &Chord, b: &Chord, kind: VoiceLeadingKind) -> f32 {
     let vl = optimal_voice_leading(a, b);
     if vl.is_empty() {
@@ -636,6 +640,33 @@ impl TonnetzState {
         // low confidence → heavy smoothing (0.97)
         let smoothing = 0.97 - 0.27 * confidence;
 
+        if self.orbifold == OrbifoldType::Notes {
+            // For T¹/S₁: use motion_x as angular velocity around the circle.
+            // Positive motion_x → clockwise (ascending pitch classes).
+            self.nav_velocity[0] =
+                smoothing * self.nav_velocity[0] + (1.0 - smoothing) * ctl.motion_x;
+            // Accumulate angular position (stored as pitch-class in [0, 12))
+            self.position[0] = (self.position[0] + self.nav_velocity[0] * speed * 12.0)
+                .rem_euclid(12.0);
+
+            // Snap to nearest note
+            if !self.nodes.is_empty() {
+                let target = (self.position[0].round() as usize) % self.nodes.len();
+                if target != self.current_chord_idx {
+                    if self.chord_trail.len() >= TRAIL_LEN {
+                        self.chord_trail.pop_front();
+                    }
+                    self.chord_trail.push_back(self.current_chord_idx);
+                    self.current_chord_idx = target;
+                }
+            }
+            if self.position_trail.len() >= TRAIL_LEN {
+                self.position_trail.pop_front();
+            }
+            self.position_trail.push_back(self.position);
+            return;
+        }
+
         // Apply motion with smoothing.
         // For triads the z-axis (second shape dimension) is driven by tension.
         let signal = [ctl.motion_x, ctl.motion_y, ctl.tension - 0.5];
@@ -728,6 +759,7 @@ impl TonnetzState {
     /// Each edge in the graph IS a voice leading.  This method finds the
     /// neighbor whose optimal voice leading best matches the requested
     /// `VoiceLeadingKind` and jumps there.  Returns `true` if the chord changed.
+    #[allow(dead_code)]
     pub fn navigate_by_voice_leading(&mut self, kind: VoiceLeadingKind) -> bool {
         if self.nodes.is_empty() {
             return false;
@@ -778,6 +810,97 @@ impl TonnetzState {
             }
         }
         false
+    }
+
+    /// Navigate to the neighbor whose orbifold-space direction best matches
+    /// `target_angle` (radians, 0 = +x / ascending transposition, π/2 = +y /
+    /// wider interval or shape dimension).  Only moves if the best candidate is
+    /// within ±90° of the target.  Returns true if the chord changed.
+    pub fn navigate_direction(&mut self, target_angle: f32) -> bool {
+        if self.nodes.is_empty() {
+            return false;
+        }
+        let idx = self.current_chord_idx;
+        let cur_ox = self.nodes[idx].ox;
+        let cur_oy = self.nodes[idx].oy;
+        let period = self.orbifold.domain_period();
+
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_idx = None;
+
+        for edge in &self.edges {
+            let other_idx = if edge.from == idx {
+                edge.to
+            } else if edge.to == idx {
+                edge.from
+            } else {
+                continue;
+            };
+            let other = &self.nodes[other_idx];
+            let raw_dx = (other.ox - cur_ox).rem_euclid(period);
+            let dx = if raw_dx > period / 2.0 { raw_dx - period } else { raw_dx };
+            let dy = other.oy - cur_oy;
+            let angle = dy.atan2(dx);
+            let score = (angle - target_angle).cos();
+            if score > best_score {
+                best_score = score;
+                best_idx = Some(other_idx);
+            }
+        }
+
+        if let Some(target) = best_idx {
+            if best_score > 0.0 {
+                if self.chord_trail.len() >= TRAIL_LEN {
+                    self.chord_trail.pop_front();
+                }
+                self.chord_trail.push_back(self.current_chord_idx);
+                if self.position_trail.len() >= TRAIL_LEN {
+                    self.position_trail.pop_front();
+                }
+                self.position_trail.push_back(self.position);
+
+                self.current_chord_idx = target;
+                self.position = [
+                    self.nodes[target].ox,
+                    self.nodes[target].oy,
+                    self.nodes[target].oz,
+                ];
+                self.nav_velocity = [0.0; 3];
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Step around the T¹/S₁ circle by `steps` positions (positive = clockwise,
+    /// i.e. ascending pitch classes; negative = counter-clockwise).
+    /// Only meaningful when orbifold == Notes. Returns true if the chord changed.
+    pub fn navigate_circle(&mut self, steps: i32) -> bool {
+        if self.nodes.is_empty() || steps == 0 {
+            return false;
+        }
+        let n = self.nodes.len() as i32;
+        let target = ((self.current_chord_idx as i32 + steps) % n + n) as usize % self.nodes.len();
+        if target == self.current_chord_idx {
+            return false;
+        }
+        if self.chord_trail.len() >= TRAIL_LEN {
+            self.chord_trail.pop_front();
+        }
+        self.chord_trail.push_back(self.current_chord_idx);
+        if self.position_trail.len() >= TRAIL_LEN {
+            self.position_trail.pop_front();
+        }
+        self.position_trail.push_back(self.position);
+
+        self.current_chord_idx = target;
+        self.position = [
+            self.nodes[target].ox,
+            self.nodes[target].oy,
+            self.nodes[target].oz,
+        ];
+        self.nav_velocity = [0.0; 3];
+        true
     }
 }
 

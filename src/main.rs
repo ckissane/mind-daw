@@ -366,6 +366,7 @@ fn fbcsp_to_classifier_prediction(
 ///   left hand    → lower top voice (contract chord from above)
 ///   eyes closed  → raise bottom voice (contract chord from below)
 ///   eyes open    → lower bottom voice (expand chord downward)
+#[allow(dead_code)]
 fn action_voice_leading(label: &str) -> Option<tonnetz::VoiceLeadingKind> {
     use tonnetz::VoiceLeadingKind::*;
     let l = label.to_ascii_lowercase();
@@ -386,6 +387,65 @@ fn action_voice_leading(label: &str) -> Option<tonnetz::VoiceLeadingKind> {
         "eyes_open" | "eyes open" | "focus" | "focused" => Some(LowerBottom),
 
         "breath_hold" | "breath hold"                    => Some(RaiseTop),
+
+        _ => None,
+    }
+}
+
+/// Map detected actions to circle steps for T¹/S₁ navigation.
+/// Negative = counter-clockwise (descending pitch), positive = clockwise (ascending pitch).
+/// Left limb → left (counter-clockwise), right limb → right (clockwise).
+fn action_circle_steps(label: &str) -> Option<i32> {
+    let l = label.to_ascii_lowercase();
+    let l = l.trim();
+    match l.as_ref() {
+        "motor_left_hand" | "motor left hand"
+        | "left_hand" | "left hand"                     => Some(-1),  // counter-clockwise
+        "motor_right_hand" | "motor right hand"
+        | "right_hand" | "right hand"                   => Some(1),   // clockwise
+
+        "blink" | "blink_right" | "blink right"         => Some(1),
+        "blink_left" | "blink left"                     => Some(-1),
+
+        "jaw_clench" | "jaw clench" | "jaw"             => Some(-1),
+
+        "eyes_closed" | "eyes closed" | "relax"         => Some(-1),
+        "eyes_open" | "eyes open" | "focus" | "focused" => Some(1),
+
+        "breath_hold" | "breath hold"                    => Some(1),
+
+        _ => None,
+    }
+}
+
+/// Map detected actions to orbifold-space direction angles for T²/S₂ and T³/S₃.
+/// 0 = right (+transposition), π/2 = up (+interval / wider voicing),
+/// π = left (−transposition), −π/2 = down (−interval / tighter voicing).
+///
+/// Six events → six distinct directions:
+///   right-hand → right (0),   left-hand → left (π),
+///   blink      → up (π/2),    jaw clench → down (−π/2),
+///   eyes-open  → up-right,    eyes-closed → up-left,
+///   breath     → up (π/2).
+fn action_direction(label: &str) -> Option<f32> {
+    use std::f32::consts::*;
+    let l = label.to_ascii_lowercase();
+    let l = l.trim();
+    match l.as_ref() {
+        "motor_right_hand" | "motor right hand"
+        | "right_hand" | "right hand"                   => Some(0.0),              // right
+        "motor_left_hand" | "motor left hand"
+        | "left_hand" | "left hand"                     => Some(PI),               // left
+
+        "blink" | "blink_right" | "blink right"         => Some(FRAC_PI_2),        // up
+        "blink_left" | "blink left"                     => Some(-FRAC_PI_2),       // down
+
+        "jaw_clench" | "jaw clench" | "jaw"             => Some(-FRAC_PI_2),       // down
+
+        "eyes_open" | "eyes open" | "focus" | "focused" => Some(FRAC_PI_4),        // up-right
+        "eyes_closed" | "eyes closed" | "relax"         => Some(PI - FRAC_PI_4),   // up-left
+
+        "breath_hold" | "breath hold"                    => Some(FRAC_PI_2),        // up
 
         _ => None,
     }
@@ -1127,35 +1187,63 @@ impl MindDaw {
                                 this.tonnetz_state.update_from_control(&this.control_state);
                             }
 
-                            // Action-driven navigation: detected events → voice-leading jumps.
-                            // Each edge in the orbifold graph IS a voice leading (Tymoczko).
-                            // Actions map to voice-leading types, not spatial directions.
-                            // Debounce: at most one jump per 400 ms.
+                            // Action-driven navigation: detected events → jumps.
+                            // For Notes (T¹/S₁): motor left/right step around the circle.
+                            // For Dyads/Triads: voice-leading types, not spatial directions.
+                            // Debounce: at most one jump per 2 s.
                             if this.tonnetz_manual_nav
                                 && this.last_action_nav.elapsed().as_secs_f32() > 2.0
                             {
-                                let mut nav_kind: Option<tonnetz::VoiceLeadingKind> = None;
+                                let is_notes_orb = this.tonnetz_state.orbifold
+                                    == tonnetz::OrbifoldType::Notes;
 
-                                // Raw blink / jaw clench detections
-                                if blink {
-                                    nav_kind = action_voice_leading("blink");
-                                }
-                                if jaw && nav_kind.is_none() {
-                                    nav_kind = action_voice_leading("jaw_clench");
-                                }
-                                // FBCSP classifier predictions
-                                if nav_kind.is_none() {
-                                    if let Some(ref pred) = this.rec.last_prediction {
-                                        if pred.confidence > 0.5 && !pred.is_novel {
-                                            nav_kind =
-                                                action_voice_leading(&pred.predicted_label);
+                                if is_notes_orb {
+                                    // For Notes: map actions to circle steps
+                                    let mut steps: Option<i32> = None;
+                                    if blink {
+                                        steps = action_circle_steps("blink");
+                                    }
+                                    if jaw && steps.is_none() {
+                                        steps = action_circle_steps("jaw_clench");
+                                    }
+                                    if steps.is_none() {
+                                        if let Some(ref pred) = this.rec.last_prediction {
+                                            if pred.confidence > 0.5 && !pred.is_novel {
+                                                steps = action_circle_steps(
+                                                    &pred.predicted_label,
+                                                );
+                                            }
                                         }
                                     }
-                                }
+                                    if let Some(s) = steps {
+                                        if this.tonnetz_state.navigate_circle(s) {
+                                            this.last_action_nav = now;
+                                        }
+                                    }
+                                } else {
+                                    // Dyads / Triads: directional navigation
+                                    // in orbifold space, matching mini-graph layout.
+                                    let mut dir: Option<f32> = None;
+                                    if blink {
+                                        dir = action_direction("blink");
+                                    }
+                                    if jaw && dir.is_none() {
+                                        dir = action_direction("jaw_clench");
+                                    }
+                                    if dir.is_none() {
+                                        if let Some(ref pred) = this.rec.last_prediction {
+                                            if pred.confidence > 0.5 && !pred.is_novel {
+                                                dir = action_direction(
+                                                    &pred.predicted_label,
+                                                );
+                                            }
+                                        }
+                                    }
 
-                                if let Some(kind) = nav_kind {
-                                    if this.tonnetz_state.navigate_by_voice_leading(kind) {
-                                        this.last_action_nav = now;
+                                    if let Some(angle) = dir {
+                                        if this.tonnetz_state.navigate_direction(angle) {
+                                            this.last_action_nav = now;
+                                        }
                                     }
                                 }
                             }
@@ -4436,8 +4524,6 @@ impl MindDaw {
             let gcx = graph_w / 2.0;
             let gcy = graph_h / 2.0;
             let grad = graph_w.min(graph_h) * 0.34;
-            let n_nb = neighbors.len().max(1);
-
             // Get allowed types for the mini-graph
             let mg_allowed: Vec<&str> = self
                 .sc_active_profile
@@ -4446,12 +4532,44 @@ impl MindDaw {
                 .unwrap_or_default();
 
             // (canvas-local x, canvas-local y, node_index, hue, is_allowed)
+            //
+            // Position each neighbor by its **direction in orbifold space** so that
+            // clicking the same side of the mini-graph always moves the same way.
+            let is_notes_orb = self.tonnetz_state.orbifold == tonnetz::OrbifoldType::Notes;
+            let cur_node = &self.tonnetz_state.nodes[current_idx];
+            let cur_ox = cur_node.ox;
+            let cur_oy = cur_node.oy;
+            let orb_period = self.tonnetz_state.orbifold.domain_period();
             let graph_nodes: Vec<(f32, f32, usize, f32, bool)> = neighbors
                 .iter()
                 .enumerate()
-                .map(|(i, (idx, _, _, _))| {
-                    let angle = i as f32 * 2.0 * std::f32::consts::PI / n_nb as f32
-                        - std::f32::consts::FRAC_PI_2;
+                .map(|(_, (idx, _, _, _))| {
+                    let angle = if is_notes_orb {
+                        // Notes: clockwise (ascending pc) = right, ccw = left
+                        let cur_pc = current_idx as i32;
+                        let nb_pc = *idx as i32;
+                        let diff = (nb_pc - cur_pc).rem_euclid(12);
+                        if diff <= 6 {
+                            let frac = (diff - 1) as f32 / 5.0;
+                            -frac * std::f32::consts::FRAC_PI_2
+                        } else {
+                            let steps_ccw = (12 - diff) as f32;
+                            let frac = (steps_ccw - 1.0) / 5.0;
+                            std::f32::consts::PI - frac * std::f32::consts::FRAC_PI_2
+                        }
+                    } else {
+                        // Dyads / Triads: direction in orbifold (ox, oy) space.
+                        // Canvas y goes down, so negate dy to make +oy = up.
+                        let nb = &self.tonnetz_state.nodes[*idx];
+                        let raw_dx = (nb.ox - cur_ox).rem_euclid(orb_period);
+                        let dx = if raw_dx > orb_period / 2.0 {
+                            raw_dx - orb_period
+                        } else {
+                            raw_dx
+                        };
+                        let dy = nb.oy - cur_oy;
+                        (-dy).atan2(dx)
+                    };
                     let chord = &self.tonnetz_state.nodes[*idx].chord;
                     let hue_idx = chord.hue_index();
                     let hue_f = [0.58_f32, 0.75, 0.0, 0.15, 0.45, 0.5][hue_idx as usize % 6];
